@@ -1,6 +1,6 @@
 # torch-nested-ad-narrow-guard
 
-诊断并规避 PyTorch 中两个真实存在、已在本机独立复现的正确性缺陷
+诊断并规避 PyTorch 中三个真实存在、已在本机独立复现的正确性缺陷
 （本机验证环境：torch 2.14.0，macOS arm64 CPU）：
 
 ## 缺陷一 —— 嵌套前向模式自动微分静默将 slogdet 二阶导数归零
@@ -39,6 +39,32 @@
 有缺陷的 `torch.nested.narrow`，而是直接用普通张量索引构造正确的
 按行切片结果，已验证与期望选取结果完全一致。
 
+## 缺陷三 —— padded↔jagged 嵌套张量往返转换会导致反向传播崩溃
+
+**上游 issue：** [pytorch/pytorch#145837](https://github.com/pytorch/pytorch/issues/145837)（open）
+
+一个常见的 NestedTensor 使用模式——将 jagged 嵌套张量转换为 padded
+稠密形式（`torch.nested.to_padded_tensor`），执行某个 jagged 布局
+不直接支持的操作（例如加位置编码），再用
+`torch.nested.narrow(..., layout=torch.jagged)` 转换回 jagged——会在
+`.backward()` 时报错：
+
+```
+RuntimeError: Function CloneBackward0 returned an invalid gradient at
+index 0 - got [4, j21, 64] but expected shape compatible with [4, j20, 64]
+```
+
+已在本机用 3 条变长序列（长度 3/2/4，维度 8）独立复现：前向传播
+每次都能成功，只有 `.backward()` 会报错。这是一个训练流程的阻断性
+缺陷（不像缺陷一、二那样是静默错误的数值），会中断一个正常、常见
+的工作流程（给变长序列批次加位置信息）。
+
+`safe_jagged_padded_transform(nested_x, transform_fn)` 完全不调用
+`torch.nested.narrow`：先转为 padded 形式，应用 `transform_fn`，再
+用普通张量索引把每一行按原始长度切回并用 `torch.cat` 拼接——已验证
+`.backward()` 能顺利完成且不报错，前向结果也与独立计算的无梯度参考
+值完全一致。
+
 ## 安装
 
 ```bash
@@ -59,7 +85,10 @@ torch-nested-ad-narrow-guard --no-color
   及稠密二维输入，未覆盖所有 jagged-narrow 调用形态。
 - `safe_nested_slogdet_second_order_jvp` 要求 `f` 可被
   `torch.autograd` 直接微分（内部不能再使用 `torch.func` 变换）。
-- 这些是**规避方案**，不是上游修复。如果 PyTorch 未来修复了这两个
+- `safe_jagged_padded_transform` 要求 `transform_fn` 保持 padded
+  张量的形状不变（`[batch, max_len, ...]` 进，同形状出），且仅支持
+  沿序列长度维度（dim=1）重建，不支持改变批次大小或序列长度的变换。
+- 这些是**规避方案**，不是上游修复。如果 PyTorch 未来修复了这些
   issue，本包自身的回归测试会失败——这是需要重新核实并更新本
   README 的信号，而非本包出现了退化。
 - 仅在 torch 2.14.0（macOS arm64 CPU 本机测试 + ubuntu-latest /

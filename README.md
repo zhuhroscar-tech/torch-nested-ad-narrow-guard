@@ -1,6 +1,6 @@
 # torch-nested-ad-narrow-guard
 
-Diagnoses and guards two real, independently-reproduced correctness bugs
+Diagnoses and guards three real, independently-reproduced correctness bugs
 in PyTorch (torch 2.14.0 confirmed on this host, macOS arm64 CPU):
 
 ## Bug 1 — nested forward-mode AD silently zeros a slogdet second derivative
@@ -82,6 +82,63 @@ per-row slices directly with plain Python/tensor indexing and returns
 them as a list of tensors — verified to match the expected selection
 exactly.
 
+## Bug 3 — padded↔jagged nested-tensor roundtrip crashes the backward pass
+
+**Upstream issue:** [pytorch/pytorch#145837](https://github.com/pytorch/pytorch/issues/145837) (open)
+
+A common NestedTensor pattern — convert a jagged nested tensor to
+padded form with `torch.nested.to_padded_tensor`, apply some
+operation unsupported directly in jagged layout (e.g. adding a
+positional embedding), then convert back to jagged with
+`torch.nested.narrow(..., layout=torch.jagged)` — raises on
+`.backward()`:
+
+```
+RuntimeError: Function CloneBackward0 returned an invalid gradient at
+index 0 - got [4, j21, 64] but expected shape compatible with [4, j20, 64]
+```
+
+Independently reproduced on this host with a 3-sequence jagged batch
+(lengths 3/2/4, embedding dim 8):
+
+```python
+import torch
+import torch.nn as nn
+
+def padded_from_jagged(tensor, pad_value=0.0):
+    offsets = tensor.offsets()
+    padded = torch.nested.to_padded_tensor(tensor, padding=pad_value)
+    return padded, offsets
+
+def jagged_from_padded(tensor, offsets, contiguous=True):
+    seq_lens = offsets.diff()
+    jagged = torch.nested.narrow(tensor, dim=1, start=0, length=seq_lens, layout=torch.jagged)
+    return jagged.contiguous() if contiguous else jagged
+
+values = torch.randn(9, 8, requires_grad=True)
+offsets = torch.tensor([0, 3, 5, 9])
+x = torch.nested.nested_tensor_from_jagged(values, offsets)
+
+padded, offs = padded_from_jagged(x)
+padded = padded + torch.randn(1, padded.shape[1], 8)
+jagged = jagged_from_padded(padded, offs)
+jagged.values().mean().backward()
+# RuntimeError: Function CloneBackward0 returned an invalid gradient ...
+```
+
+The forward pass succeeds every time; only `.backward()` fails. This
+is a training-loop stopper for a normal, expected workflow (adding
+positional information to variable-length sequence batches), not a
+silently-wrong-output bug like bugs 1 and 2.
+
+`safe_jagged_padded_transform(nested_x, transform_fn)` never calls
+`torch.nested.narrow`. Instead it pads, applies `transform_fn`,
+reconstructs the jagged tensor by slicing each row back to its
+original length with plain Python/tensor indexing, and
+re-concatenates with `torch.cat` — verified on this host to complete
+`.backward()` without raising, and to produce forward values that
+exactly match an independent no-grad reference computed the same way.
+
 ## Install
 
 ```bash
@@ -104,6 +161,7 @@ this host's installed torch build, `1` if a guard itself is wrong,
 from torch_nested_ad_narrow_guard import (
     safe_nested_slogdet_second_order_jvp,
     safe_jagged_narrow_unbind,
+    safe_jagged_padded_transform,
 )
 ```
 
@@ -117,10 +175,15 @@ from torch_nested_ad_narrow_guard import (
   autograd-differentiable** (no internal `torch.func` transforms) —
   it does not generalize to arbitrary user functions that themselves
   use forward-mode AD internally.
-- **These are workarounds, not upstream fixes.** If PyTorch fixes
-  either issue in a future release, this package's own regression
+- **`safe_jagged_padded_transform` requires `transform_fn` to preserve
+  the padded tensor's shape** (`[batch, max_len, ...]` in, same shape
+  out) and only reconstructs along dim=1 (sequence length) — it does
+  not support transforms that change batch size or sequence length.
+- **These are workarounds, not upstream fixes.** If PyTorch fixes any
+  of these issues in a future release, this package's own regression
   tests (`test_slogdet_nested_jvp_silently_returns_zero_on_this_host`,
-  `test_narrow_unbind_silently_includes_unselected_element_on_this_host`)
+  `test_narrow_unbind_silently_includes_unselected_element_on_this_host`,
+  `test_padded_jagged_roundtrip_breaks_backward_on_this_host`)
   will start failing — that is the intended signal to re-check the
   issue and update this README, not a regression in this package.
 - **Verified on torch 2.14.0** (macOS arm64 CPU via local testing,

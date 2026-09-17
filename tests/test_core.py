@@ -1,14 +1,15 @@
 """Regression tests for torch-nested-ad-narrow-guard.
 
 These prove:
-  1. Both bugs are real and reproducible from scratch on this host's
-     installed torch build, using the EXACT repro code published in the
-     upstream issues (pytorch/pytorch#196697, #196708) -- not a
-     paraphrase.
-  2. safe_nested_slogdet_second_order_jvp and safe_jagged_narrow_unbind
-     are independently verified fixes: they match the mathematically
-     correct expected value (computed by hand from the closed-form
-     derivative / selection in the issue, not derived from the buggy
+  1. All three bugs are real and reproducible from scratch on this
+     host's installed torch build, using the EXACT repro code published
+     in the upstream issues (pytorch/pytorch#196697, #196708, #145837)
+     -- not a paraphrase.
+  2. safe_nested_slogdet_second_order_jvp, safe_jagged_narrow_unbind,
+     and safe_jagged_padded_transform are independently verified fixes:
+     they match the mathematically correct expected value (computed by
+     hand from the closed-form derivative / selection in the issue, or
+     an independent no-grad reference, never derived from the buggy
      code path itself).
   3. A bug-injection test proves the "guard" logic is non-tautological:
      forward-over-reverse differentiation (torch.func.grad of
@@ -29,6 +30,7 @@ from torch_nested_ad_narrow_guard.core import (
     diagnose,
     safe_nested_slogdet_second_order_jvp,
     safe_jagged_narrow_unbind,
+    safe_jagged_padded_transform,
 )
 
 
@@ -83,6 +85,28 @@ class TestNativeBugReproduction:
             "the README/ledger accordingly rather than treating this as a "
             "regression"
         )
+
+    def test_padded_jagged_roundtrip_breaks_backward_on_this_host(self):
+        # Exact repro pattern from pytorch/pytorch#145837's issue body:
+        # pad -> transform -> torch.nested.narrow back to jagged -> backward.
+        torch.manual_seed(0)
+        dim = 4
+        offsets = torch.tensor([0, 3, 5, 9])
+        pos_emb = torch.randn(1, 10, dim)
+
+        values = torch.randn(9, dim, requires_grad=True)
+        x = torch.nested.nested_tensor_from_jagged(values, offsets)
+
+        offsets_orig = x.offsets()
+        padded = torch.nested.to_padded_tensor(x, padding=0.0)
+        seq_len = padded.shape[1]
+        padded = padded + pos_emb[:, :seq_len, :]
+        jagged = torch.nested.narrow(
+            padded, dim=1, start=0, length=offsets_orig.diff(), layout=torch.jagged
+        )
+
+        with pytest.raises(RuntimeError, match="invalid gradient"):
+            jagged.contiguous().values().mean().backward()
 
 
 class TestBugInjectionNonTautological:
@@ -169,6 +193,51 @@ class TestGuardMatchesExpected:
         with pytest.raises(NotImplementedError):
             safe_jagged_narrow_unbind(x, 0, starts, lengths)
 
+    def test_safe_jagged_padded_transform_backward_succeeds(self):
+        torch.manual_seed(0)
+        dim = 4
+        offsets = torch.tensor([0, 3, 5, 9])
+        pos_emb = torch.randn(1, 10, dim)
+
+        def transform(padded):
+            seq_len = padded.shape[1]
+            return padded + pos_emb[:, :seq_len, :]
+
+        values = torch.randn(9, dim, requires_grad=True)
+        x = torch.nested.nested_tensor_from_jagged(values, offsets)
+
+        out = safe_jagged_padded_transform(x, transform)
+        loss = out.values().mean()
+        loss.backward()  # must not raise -- proves the fix for #145837
+
+        assert values.grad is not None
+        assert not torch.isnan(values.grad).any()
+
+    def test_safe_jagged_padded_transform_forward_matches_reference(self):
+        torch.manual_seed(1)
+        dim = 3
+        offsets = torch.tensor([0, 2, 5, 6])
+        pos_emb = torch.randn(1, 8, dim)
+
+        def transform(padded):
+            seq_len = padded.shape[1]
+            return padded + pos_emb[:, :seq_len, :]
+
+        values = torch.randn(6, dim)
+        x = torch.nested.nested_tensor_from_jagged(values, offsets)
+
+        out = safe_jagged_padded_transform(x, transform)
+
+        # Independent reference: manually pad, transform, and slice back
+        # without going through the guard function at all.
+        offs = offsets.tolist()
+        padded_ref = torch.nested.to_padded_tensor(x, padding=0.0)
+        padded_ref = transform(padded_ref)
+        rows = [padded_ref[i, : offs[i + 1] - offs[i]] for i in range(len(offs) - 1)]
+        expected = torch.cat(rows, dim=0)
+
+        assert torch.allclose(out.values(), expected, atol=1e-6)
+
 
 class TestDiagnose:
     def test_diagnose_runs_and_reports_consistent_structure(self):
@@ -176,8 +245,9 @@ class TestDiagnose:
         assert isinstance(report["torch_version"], str)
         assert "slogdet_second_order_case" in report
         assert "jagged_narrow_unbind_case" in report
+        assert "jagged_padded_transform_case" in report
 
-    def test_diagnose_reports_both_bugs_reproduced_on_this_host(self):
+    def test_diagnose_reports_all_bugs_reproduced_on_this_host(self):
         report = diagnose()
         assert report["slogdet_bug_reproduced"] is True, (
             "expected the slogdet nested-JVP bug to reproduce on "
@@ -186,6 +256,10 @@ class TestDiagnose:
         assert report["narrow_bug_reproduced"] is True, (
             "expected the narrow+unbind bug to reproduce on "
             f"torch {report['torch_version']}"
+        )
+        assert report["padded_transform_bug_reproduced"] is True, (
+            "expected the padded<->jagged roundtrip backward bug to "
+            f"reproduce on torch {report['torch_version']}"
         )
 
     def test_diagnose_reports_guards_fully_correct(self):

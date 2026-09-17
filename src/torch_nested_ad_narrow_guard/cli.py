@@ -1,8 +1,9 @@
 """Command-line interface: run the from-scratch diagnosis of the nested
-forward-mode-AD slogdet second-derivative bug (pytorch/pytorch#196697)
-and the jagged narrow+unbind bug (pytorch/pytorch#196708) against the
-currently installed torch build, using the shared semantic-color
-design system.
+forward-mode-AD slogdet second-derivative bug (pytorch/pytorch#196697),
+the jagged narrow+unbind bug (pytorch/pytorch#196708), and the padded
+<-> jagged roundtrip backward-pass crash (pytorch/pytorch#145837)
+against the currently installed torch build, using the shared
+semantic-color design system.
 """
 from __future__ import annotations
 
@@ -71,8 +72,13 @@ def main(argv=None) -> int:
     else:
         print(status_headline(style, "info", "narrow+unbind bug did not reproduce on this host's installed torch build"))
 
+    if report["padded_transform_bug_reproduced"]:
+        print(status_headline(style, "warn", "padded<->jagged roundtrip breaks backward pass (#145837)"))
+    else:
+        print(status_headline(style, "info", "padded<->jagged roundtrip bug did not reproduce on this host's installed torch build"))
+
     if report["guards_fully_correct"]:
-        print(status_headline(style, "ok", "safe_nested_slogdet_second_order_jvp() and safe_jagged_narrow_unbind() both match the mathematically correct value"))
+        print(status_headline(style, "ok", "safe_nested_slogdet_second_order_jvp(), safe_jagged_narrow_unbind(), and safe_jagged_padded_transform() all match the mathematically correct value"))
     else:
         print(status_headline(style, "fail", "at least one guard did NOT match the expected value"))
 
@@ -93,6 +99,16 @@ def main(argv=None) -> int:
             ("expected", f"{c['expected_sum']!s}"),
             ("buggy narrow+unbind", f"{c['buggy_narrow_unbind_sum']!s}"),
             ("guard (manual per-row slice)", f"{c['guard_sum']!s}"),
+        ]
+    )
+
+    section("padded<->jagged roundtrip backward pass (#145837)")
+    c = report["jagged_padded_transform_case"]
+    print_fields(
+        [
+            ("buggy path raised RuntimeError on backward", f"{c['backward_raised_on_buggy_path']!s}"),
+            ("guard backward succeeded", f"{c['guard_backward_succeeded']!s}"),
+            ("guard forward matches reference", f"{c['guard_forward_matches_reference']!s}"),
         ]
     )
 

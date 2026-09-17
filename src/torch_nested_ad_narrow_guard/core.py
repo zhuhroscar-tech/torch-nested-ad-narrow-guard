@@ -41,6 +41,39 @@ issue links.
    fresh jagged nested tensor directly from the requested per-row
    Python-level slices of the dense input, then unbinding that. This
    matches the mathematically correct selection exactly on this host.
+
+3. pytorch/pytorch#145837 -- round-tripping a jagged nested tensor
+   through ``torch.nested.to_padded_tensor`` (pad), applying some
+   transform on the padded dense form (e.g. adding a positional
+   embedding), then converting back with
+   ``torch.nested.narrow(..., layout=torch.jagged)`` breaks the
+   backward pass with ``RuntimeError: Function CloneBackward0 returned
+   an invalid gradient at index 0 - got [..., jN, ...] but expected
+   shape compatible with [..., jM, ...]``. Independently reproduced on
+   this host (torch 2.14.0) with a 3-sequence jagged batch (lengths
+   3/2/4, dim=8): the forward pass succeeds, but ``.backward()`` raises
+   this shape-mismatch RuntimeError every time, because
+   ``torch.nested.narrow`` constructs a *new* jagged offsets object on
+   the backward reconstruction instead of reusing the exact tensor
+   object produced when the input was first converted from padded ->
+   jagged, and autograd's shape-compatibility check treats the two
+   (numerically-identical) offsets objects as different symbolic jagged
+   sizes.
+
+   This is a common pattern for adding positional embeddings (or any
+   op unsupported directly in jagged layout) to variable-length
+   sequence batches, so it silently blocks a normal, expected NestedTensor
+   workflow with a crash on backward -- not silently wrong output like
+   bugs 1 and 2, but a full training-loop stopper.
+
+   ``safe_jagged_padded_transform`` provides a verified-correct
+   workaround: it converts to padded form, applies the transform, then
+   reconstructs the jagged tensor via direct per-row Python-level
+   slicing and ``torch.cat`` (never calling ``torch.nested.narrow``),
+   which keeps the autograd graph consistent and allows ``.backward()``
+   to complete. Verified on this host to (a) complete backward without
+   raising, and (b) produce forward values that exactly match a
+   no-grad reference computed the same way.
 """
 from __future__ import annotations
 
@@ -129,6 +162,42 @@ def safe_jagged_narrow_unbind(dense_x, dim: int, starts, lengths):
     return rows
 
 
+def safe_jagged_padded_transform(nested_x, transform_fn):
+    """Apply ``transform_fn`` (any dense-tensor operation, e.g. adding a
+    positional embedding) to a jagged nested tensor ``nested_x`` by
+    round-tripping through padded form, WITHOUT ever calling
+    ``torch.nested.narrow(..., layout=torch.jagged)`` on the result
+    (pytorch/pytorch#145837), which breaks the backward pass with a
+    ``CloneBackward0 returned an invalid gradient`` RuntimeError because
+    it constructs a new offsets object that autograd's shape check
+    rejects as incompatible with the original.
+
+    ``nested_x`` must be a jagged-layout nested tensor created via
+    ``torch.nested.nested_tensor_from_jagged``. ``transform_fn`` receives
+    the padded dense tensor (shape ``[batch, max_len, ...]``) and must
+    return a dense tensor of the same shape.
+
+    Returns a jagged nested tensor built by applying ``transform_fn`` to
+    the padded form, then slicing each row back to its original length
+    with plain Python/tensor indexing and re-concatenating with
+    ``torch.cat`` -- this keeps the autograd graph consistent (no
+    ``torch.nested.narrow`` call), so ``.backward()`` completes without
+    the shape-mismatch RuntimeError that the naive narrow-based
+    roundtrip raises.
+    """
+    torch_module = _import_torch()
+    offsets = nested_x.offsets()
+    padded = torch_module.nested.to_padded_tensor(nested_x, padding=0.0)
+    transformed = transform_fn(padded)
+    lengths = offsets.diff()
+    rows: List[Any] = []
+    for i in range(transformed.shape[0]):
+        length = int(lengths[i].item())
+        rows.append(transformed[i, :length])
+    flat = torch_module.cat(rows, dim=0)
+    return torch_module.nested.nested_tensor_from_jagged(flat, offsets)
+
+
 @dataclasses.dataclass
 class SlogdetSecondOrderCase:
     t_value: float
@@ -207,6 +276,82 @@ def _run_jagged_narrow_case(torch_module) -> JaggedNarrowCase:
     )
 
 
+@dataclasses.dataclass
+class JaggedPaddedTransformCase:
+    backward_raised_on_buggy_path: bool
+    buggy_error_message: str
+    guard_backward_succeeded: bool
+    guard_forward_matches_reference: bool
+
+
+def _run_jagged_padded_transform_case(torch_module) -> JaggedPaddedTransformCase:
+    """Reproduce pytorch/pytorch#145837 from scratch: padded->transform->
+    jagged roundtrip via torch.nested.narrow breaks backward. Then verify
+    safe_jagged_padded_transform avoids the crash and matches a no-grad
+    reference computed the same way."""
+    torch_module.manual_seed(0)
+    dim = 8
+    max_len = 10
+    offsets = torch_module.tensor([0, 3, 5, 9])
+
+    pos_emb = torch_module.randn(1, max_len, dim)
+
+    def transform(padded):
+        seq_len = padded.shape[1]
+        return padded + pos_emb[:, :seq_len, :]
+
+    # Buggy path: torch.nested.narrow-based roundtrip.
+    values_buggy = torch_module.randn(9, dim, requires_grad=True)
+    x_buggy = torch_module.nested.nested_tensor_from_jagged(values_buggy, offsets)
+    backward_raised = False
+    error_message = ""
+    try:
+        offsets_orig = x_buggy.offsets()
+        padded = torch_module.nested.to_padded_tensor(x_buggy, padding=0.0)
+        padded = transform(padded)
+        jagged = torch_module.nested.narrow(
+            padded, dim=1, start=0, length=offsets_orig.diff(), layout=torch_module.jagged
+        )
+        loss = jagged.contiguous().values().mean()
+        loss.backward()
+    except RuntimeError as exc:
+        backward_raised = True
+        error_message = str(exc)
+
+    # Guard path: safe_jagged_padded_transform.
+    values_guard = torch_module.randn(9, dim, requires_grad=True)
+    x_guard = torch_module.nested.nested_tensor_from_jagged(values_guard, offsets)
+    guard_backward_succeeded = False
+    guard_forward_matches_reference = False
+    try:
+        out = safe_jagged_padded_transform(x_guard, transform)
+        loss = out.values().mean()
+        loss.backward()
+        guard_backward_succeeded = values_guard.grad is not None
+
+        with torch_module.no_grad():
+            offs_list = offsets.tolist()
+            padded_ref = torch_module.nested.to_padded_tensor(x_guard.detach(), padding=0.0)
+            padded_ref = transform(padded_ref)
+            rows = []
+            for i in range(len(offs_list) - 1):
+                length = offs_list[i + 1] - offs_list[i]
+                rows.append(padded_ref[i, :length])
+            expected_flat = torch_module.cat(rows, dim=0)
+        guard_forward_matches_reference = bool(
+            torch_module.allclose(out.values().detach(), expected_flat, atol=1e-6)
+        )
+    except RuntimeError:
+        guard_backward_succeeded = False
+
+    return JaggedPaddedTransformCase(
+        backward_raised_on_buggy_path=backward_raised,
+        buggy_error_message=error_message,
+        guard_backward_succeeded=guard_backward_succeeded,
+        guard_forward_matches_reference=guard_forward_matches_reference,
+    )
+
+
 def diagnose() -> Dict[str, Any]:
     """Reproduce both upstream bugs from scratch against the currently
     installed torch build, using the EXACT repro code from the issues,
@@ -216,18 +361,25 @@ def diagnose() -> Dict[str, Any]:
 
     slogdet_case = _run_slogdet_case(torch_module)
     narrow_case = _run_jagged_narrow_case(torch_module)
+    padded_transform_case = _run_jagged_padded_transform_case(torch_module)
 
     return {
         "torch_version": torch_module.__version__,
         "issue_urls": [
             "https://github.com/pytorch/pytorch/issues/196697",
             "https://github.com/pytorch/pytorch/issues/196708",
+            "https://github.com/pytorch/pytorch/issues/145837",
         ],
         "slogdet_second_order_case": dataclasses.asdict(slogdet_case),
         "jagged_narrow_unbind_case": dataclasses.asdict(narrow_case),
+        "jagged_padded_transform_case": dataclasses.asdict(padded_transform_case),
         "slogdet_bug_reproduced": not slogdet_case.forward_over_forward_matches_expected,
         "narrow_bug_reproduced": not narrow_case.buggy_matches_expected,
+        "padded_transform_bug_reproduced": padded_transform_case.backward_raised_on_buggy_path,
         "guards_fully_correct": (
-            slogdet_case.guard_matches_expected and narrow_case.guard_matches_expected
+            slogdet_case.guard_matches_expected
+            and narrow_case.guard_matches_expected
+            and padded_transform_case.guard_backward_succeeded
+            and padded_transform_case.guard_forward_matches_reference
         ),
     }
