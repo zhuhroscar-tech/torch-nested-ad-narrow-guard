@@ -4,7 +4,7 @@ Mirrors the test_cli.py pattern already used across the fleet (e.g.
 rng-leak-audit, causality-audit) for a repo that had none.
 
 The branch-coverage tests below mock ``core.diagnose`` so every CLI
-message path (torch-unavailable, the three no-bug "info" lines, and a
+message path (torch-unavailable, the four no-bug "info" lines, and a
 guard-mismatch "fail" line) is exercised deterministically, regardless
 of whether this host's installed torch build happens to reproduce the
 underlying bugs. Real fleet-wide gap found by pytest-cov inspection:
@@ -27,10 +27,16 @@ def _fake_report(**overrides):
     report = {
         "torch_version": "9.9.9-fake",
         "slogdet_bug_reproduced": False,
+        "householder_bug_reproduced": False,
         "narrow_bug_reproduced": False,
         "padded_transform_bug_reproduced": False,
         "guards_fully_correct": True,
         "slogdet_second_order_case": {
+            "expected_second_order": 1.0,
+            "forward_over_forward_jvp": 1.0,
+            "guard_reverse_over_reverse": 1.0,
+        },
+        "householder_product_second_order_case": {
             "expected_second_order": 1.0,
             "forward_over_forward_jvp": 1.0,
             "guard_reverse_over_reverse": 1.0,
@@ -121,28 +127,31 @@ def test_torch_unavailable_text_mode_reports_fail_headline_and_exit_2(monkeypatc
     assert code == 2
 
 
-def test_no_bugs_present_prints_all_three_info_lines(monkeypatch, capsys):
-    """cli.py lines 68, 73, 78: the 'info' (not 'warn') branch for each
-    of the three tracked bugs when none reproduce on this host."""
+def test_no_bugs_present_prints_all_four_info_lines(monkeypatch, capsys):
+    """cli.py lines 68, 73, 78, 83-ish: the 'info' (not 'warn') branch
+    for each of the four tracked bugs when none reproduce on this host."""
     monkeypatch.setattr(core, "diagnose", lambda: _fake_report())
     main(["--no-color"])
     out = capsys.readouterr().out
     assert "slogdet nested-JVP bug did not reproduce" in out
+    assert "householder_product nested-JVP bug did not reproduce" in out
     assert "narrow+unbind bug did not reproduce" in out
     assert "padded<->jagged roundtrip bug did not reproduce" in out
     assert "slogdet second-derivative bug reproduced" not in out
+    assert "householder_product second-derivative bug reproduced" not in out
     assert "narrow+unbind element-selection bug reproduced" not in out
     assert "padded<->jagged roundtrip breaks backward pass" not in out
 
 
-def test_all_bugs_present_prints_all_three_warn_lines(monkeypatch, capsys):
-    """Positive-branch companion: when all three bugs ARE reproduced,
-    the 'warn' headlines fire instead (lines 66, 71, 76)."""
+def test_all_bugs_present_prints_all_four_warn_lines(monkeypatch, capsys):
+    """Positive-branch companion: when all four bugs ARE reproduced,
+    the 'warn' headlines fire instead."""
     monkeypatch.setattr(
         core,
         "diagnose",
         lambda: _fake_report(
             slogdet_bug_reproduced=True,
+            householder_bug_reproduced=True,
             narrow_bug_reproduced=True,
             padded_transform_bug_reproduced=True,
         ),
@@ -150,6 +159,7 @@ def test_all_bugs_present_prints_all_three_warn_lines(monkeypatch, capsys):
     main(["--no-color"])
     out = capsys.readouterr().out
     assert "slogdet second-derivative bug reproduced" in out
+    assert "householder_product second-derivative bug reproduced" in out
     assert "narrow+unbind element-selection bug reproduced" in out
     assert "padded<->jagged roundtrip breaks backward pass" in out
 

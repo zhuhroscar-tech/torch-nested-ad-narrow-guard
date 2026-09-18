@@ -1,6 +1,6 @@
 # torch-nested-ad-narrow-guard
 
-Diagnoses and guards three real, independently-reproduced correctness bugs
+Diagnoses and guards four real, independently-reproduced correctness bugs
 in PyTorch (torch 2.14.0 confirmed on this host, macOS arm64 CPU):
 
 ## Bug 1 — nested forward-mode AD silently zeros a slogdet second derivative
@@ -132,12 +132,63 @@ positional information to variable-length sequence batches), not a
 silently-wrong-output bug like bugs 1 and 2.
 
 `safe_jagged_padded_transform(nested_x, transform_fn)` never calls
-`torch.nested.narrow`. Instead it pads, applies `transform_fn`,
+the buggy `torch.nested.narrow`. Instead it pads, applies `transform_fn`,
 reconstructs the jagged tensor by slicing each row back to its
 original length with plain Python/tensor indexing, and
 re-concatenates with `torch.cat` — verified on this host to complete
 `.backward()` without raising, and to produce forward values that
 exactly match an independent no-grad reference computed the same way.
+
+## Bug 4 — nested forward-mode AD also silently wrong for householder_product's second derivative
+
+**Upstream issue:** [pytorch/pytorch#196698](https://github.com/pytorch/pytorch/issues/196698) (open)
+
+The same failure class as Bug 1, but a distinct `torch.linalg` op,
+found independently while scouting PyTorch's `module: correctness
+(silent)` label rather than sourced from Bug 1's own issue thread.
+`torch.func.jvp` nested inside another `torch.func.jvp` call silently
+returns the wrong value for `torch.linalg.householder_product`'s
+second derivative.
+
+Exact repro (from the issue, reproduced verbatim on this host):
+
+```python
+import torch
+dtype = torch.float64
+def f(t):
+    c = torch.ones((), dtype=t.dtype)
+    a = torch.stack((c, t)).reshape(2, 1)
+    tau = (2 / (1 + t * t)).reshape(1)
+    return torch.linalg.householder_product(a, tau).sum()
+def jvp1(t):
+    return torch.func.jvp(f, (t,), (torch.ones_like(t),))[1]
+t = torch.tensor(0.7, dtype=dtype)
+_, actual = torch.func.jvp(jvp1, (t,), (torch.ones_like(t),))
+# actual   = -0.7533368863909331
+# expected = 1.556251320682393
+```
+
+Independently cross-checked against a central finite difference on
+the closed-form `f(t) = 1 - 2*(1+t)/(1+t**2)` (the column sum
+simplifies algebraically): `1.5562484634301652`, matching the
+analytic value to ~1e-5 — confirming the expected value itself, not
+just the buggy path.
+
+| Method | Result on this host |
+|---|---|
+| forward-over-forward (`jvp` of `jvp`) — **buggy** | `-0.7533368863909331` |
+| forward-over-reverse (`grad` of `jvp`) — **also buggy** | `-0.753336886390932` |
+| reverse-over-forward (`jvp` of `grad`) | raises `RuntimeError` (functorch transform restriction) |
+| reverse-over-reverse (`autograd.grad(create_graph=True)` twice) | `1.5562513206823931` ✅ |
+| central finite difference (independent oracle) | `1.5562484634301652` ✅ (matches to ~1e-5) |
+
+Unlike Bug 1, reverse-over-forward does not even run here (it raises,
+rather than silently returning a wrong value) — only reverse-over-
+reverse is verified correct for this op.
+
+`safe_nested_householder_product_second_order_jvp(f, t)` reuses the
+same reverse-over-reverse pattern as Bug 1's guard and is verified to
+match the finite-difference oracle to `1e-9`.
 
 ## Install
 
@@ -160,6 +211,7 @@ this host's installed torch build, `1` if a guard itself is wrong,
 ```python
 from torch_nested_ad_narrow_guard import (
     safe_nested_slogdet_second_order_jvp,
+    safe_nested_householder_product_second_order_jvp,
     safe_jagged_narrow_unbind,
     safe_jagged_padded_transform,
 )
@@ -182,6 +234,7 @@ from torch_nested_ad_narrow_guard import (
 - **These are workarounds, not upstream fixes.** If PyTorch fixes any
   of these issues in a future release, this package's own regression
   tests (`test_slogdet_nested_jvp_silently_returns_zero_on_this_host`,
+  `test_householder_product_nested_jvp_silently_wrong_on_this_host`,
   `test_narrow_unbind_silently_includes_unselected_element_on_this_host`,
   `test_padded_jagged_roundtrip_breaks_backward_on_this_host`)
   will start failing — that is the intended signal to re-check the

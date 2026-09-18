@@ -1,6 +1,6 @@
 # torch-nested-ad-narrow-guard
 
-诊断并规避 PyTorch 中三个真实存在、已在本机独立复现的正确性缺陷
+诊断并规避 PyTorch 中四个真实存在、已在本机独立复现的正确性缺陷
 （本机验证环境：torch 2.14.0，macOS arm64 CPU）：
 
 ## 缺陷一 —— 嵌套前向模式自动微分静默将 slogdet 二阶导数归零
@@ -64,6 +64,31 @@ index 0 - got [4, j21, 64] but expected shape compatible with [4, j20, 64]
 用普通张量索引把每一行按原始长度切回并用 `torch.cat` 拼接——已验证
 `.backward()` 能顺利完成且不报错，前向结果也与独立计算的无梯度参考
 值完全一致。
+
+## 缺陷四 —— 嵌套前向模式自动微分对 householder_product 二阶导数同样静默出错
+
+**上游 issue：** [pytorch/pytorch#196698](https://github.com/pytorch/pytorch/issues/196698)（open）
+
+与缺陷一相同的故障类型，但作用于另一个不同的 `torch.linalg` 算子。
+这个缺陷是在扫描 PyTorch 的 `module: correctness (silent)` 标签时
+独立发现的，而非来自缺陷一的 issue 线索。`torch.func.jvp` 内部再
+嵌套调用一次 `torch.func.jvp` 时，`torch.linalg.householder_product`
+的二阶导数会被静默计算为错误值。
+
+按 issue 原文精确复现（已在本机验证）：期望值 `1.556251320682393`，
+实际返回 `-0.7533368863909331`。另外用闭式表达式
+`f(t) = 1 - 2*(1+t)/(1+t**2)` 的中心差分独立核验，得到
+`1.5562484634301652`，与解析值误差约 `1e-5`，确认了期望值本身的
+正确性（不仅仅是错误路径）。
+
+与缺陷一不同的是："反向套前向"（`torch.func.jvp` 作用于
+`torch.func.grad`）在这个算子上直接抛出 `RuntimeError`，而不是
+静默返回错误值；只有"反向套反向"（两次
+`torch.autograd.grad(create_graph=True)`）经验证是正确的。
+
+`safe_nested_householder_product_second_order_jvp(f, t)` 复用与
+缺陷一相同的反向套反向微分方式，已验证与中心差分核验值的误差小于
+`1e-9`。
 
 ## 安装
 

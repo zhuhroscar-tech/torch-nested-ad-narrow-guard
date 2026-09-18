@@ -18,18 +18,21 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="torch-nested-ad-narrow-guard",
         description=(
-            "Diagnose two real torch correctness bugs against the "
+            "Diagnose four real torch correctness bugs against the "
             "currently installed torch build: (1) nested (second-order) "
             "forward-mode AD via torch.func.jvp-of-jvp silently returns "
             "0.0 instead of the correct nonzero second derivative of "
-            "torch.linalg.slogdet (pytorch/pytorch#196697), and (2) "
+            "torch.linalg.slogdet (pytorch/pytorch#196697), (2) the same "
+            "failure class for torch.linalg.householder_product's second "
+            "derivative (pytorch/pytorch#196698), (3) "
             "torch.nested.narrow(..., layout=torch.jagged) followed by "
             "unbind() silently includes an unselected element "
-            "(pytorch/pytorch#196708). Verifies that the safe_* guard "
-            "functions produce the mathematically correct result "
-            "instead. Never trusts a cached or previously-reported "
-            "result, always re-runs the repro on THIS host's actual "
-            "installed torch version."
+            "(pytorch/pytorch#196708), and (4) a padded<->jagged "
+            "roundtrip that crashes backward (pytorch/pytorch#145837). "
+            "Verifies that the safe_* guard functions produce the "
+            "mathematically correct result instead. Never trusts a "
+            "cached or previously-reported result, always re-runs the "
+            "repro on THIS host's actual installed torch version."
         ),
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON instead of text")
@@ -67,6 +70,11 @@ def main(argv=None) -> int:
     else:
         print(status_headline(style, "info", "slogdet nested-JVP bug did not reproduce on this host's installed torch build"))
 
+    if report["householder_bug_reproduced"]:
+        print(status_headline(style, "warn", "nested forward-mode AD householder_product second-derivative bug reproduced (#196698)"))
+    else:
+        print(status_headline(style, "info", "householder_product nested-JVP bug did not reproduce on this host's installed torch build"))
+
     if report["narrow_bug_reproduced"]:
         print(status_headline(style, "warn", "jagged narrow+unbind element-selection bug reproduced (#196708)"))
     else:
@@ -78,12 +86,22 @@ def main(argv=None) -> int:
         print(status_headline(style, "info", "padded<->jagged roundtrip bug did not reproduce on this host's installed torch build"))
 
     if report["guards_fully_correct"]:
-        print(status_headline(style, "ok", "safe_nested_slogdet_second_order_jvp(), safe_jagged_narrow_unbind(), and safe_jagged_padded_transform() all match the mathematically correct value"))
+        print(status_headline(style, "ok", "safe_nested_slogdet_second_order_jvp(), safe_nested_householder_product_second_order_jvp(), safe_jagged_narrow_unbind(), and safe_jagged_padded_transform() all match the mathematically correct value"))
     else:
         print(status_headline(style, "fail", "at least one guard did NOT match the expected value"))
 
     section("slogdet second-order derivative (t=0.7)")
     c = report["slogdet_second_order_case"]
+    print_fields(
+        [
+            ("expected", f"{c['expected_second_order']!s}"),
+            ("forward-over-forward jvp (buggy)", f"{c['forward_over_forward_jvp']!s}"),
+            ("guard (reverse-over-reverse)", f"{c['guard_reverse_over_reverse']!s}"),
+        ]
+    )
+
+    section("householder_product second-order derivative (t=0.7)")
+    c = report["householder_product_second_order_case"]
     print_fields(
         [
             ("expected", f"{c['expected_second_order']!s}"),
