@@ -1,9 +1,9 @@
 """Command-line interface: run the from-scratch diagnosis of the nested
-forward-mode-AD slogdet second-derivative bug (pytorch/pytorch#196697),
-the jagged narrow+unbind bug (pytorch/pytorch#196708), and the padded
-<-> jagged roundtrip backward-pass crash (pytorch/pytorch#145837)
-against the currently installed torch build, using the shared
-semantic-color design system.
+forward-mode-AD second-derivative bugs (pytorch/pytorch#196697,
+#196698, #196700), the jagged narrow+unbind bug (pytorch/pytorch#196708),
+and the padded <-> jagged roundtrip backward-pass crash
+(pytorch/pytorch#145837) against the currently installed torch build,
+using the shared semantic-color design system.
 """
 from __future__ import annotations
 
@@ -18,16 +18,18 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="torch-nested-ad-narrow-guard",
         description=(
-            "Diagnose four real torch correctness bugs against the "
+            "Diagnose five real torch correctness bugs against the "
             "currently installed torch build: (1) nested (second-order) "
             "forward-mode AD via torch.func.jvp-of-jvp silently returns "
             "0.0 instead of the correct nonzero second derivative of "
             "torch.linalg.slogdet (pytorch/pytorch#196697), (2) the same "
             "failure class for torch.linalg.householder_product's second "
-            "derivative (pytorch/pytorch#196698), (3) "
+            "derivative (pytorch/pytorch#196698), (3) the same failure "
+            "class (wrong sign) for torch.nn.functional.layer_norm's "
+            "second derivative (pytorch/pytorch#196700), (4) "
             "torch.nested.narrow(..., layout=torch.jagged) followed by "
             "unbind() silently includes an unselected element "
-            "(pytorch/pytorch#196708), and (4) a padded<->jagged "
+            "(pytorch/pytorch#196708), and (5) a padded<->jagged "
             "roundtrip that crashes backward (pytorch/pytorch#145837). "
             "Verifies that the safe_* guard functions produce the "
             "mathematically correct result instead. Never trusts a "
@@ -75,6 +77,11 @@ def main(argv=None) -> int:
     else:
         print(status_headline(style, "info", "householder_product nested-JVP bug did not reproduce on this host's installed torch build"))
 
+    if report["layer_norm_bug_reproduced"]:
+        print(status_headline(style, "warn", "nested forward-mode AD layer_norm second-derivative bug reproduced (#196700)"))
+    else:
+        print(status_headline(style, "info", "layer_norm nested-JVP bug did not reproduce on this host's installed torch build"))
+
     if report["narrow_bug_reproduced"]:
         print(status_headline(style, "warn", "jagged narrow+unbind element-selection bug reproduced (#196708)"))
     else:
@@ -86,7 +93,7 @@ def main(argv=None) -> int:
         print(status_headline(style, "info", "padded<->jagged roundtrip bug did not reproduce on this host's installed torch build"))
 
     if report["guards_fully_correct"]:
-        print(status_headline(style, "ok", "safe_nested_slogdet_second_order_jvp(), safe_nested_householder_product_second_order_jvp(), safe_jagged_narrow_unbind(), and safe_jagged_padded_transform() all match the mathematically correct value"))
+        print(status_headline(style, "ok", "safe_nested_slogdet_second_order_jvp(), safe_nested_householder_product_second_order_jvp(), safe_layer_norm_second_order_jvp(), safe_jagged_narrow_unbind(), and safe_jagged_padded_transform() all match the mathematically correct value"))
     else:
         print(status_headline(style, "fail", "at least one guard did NOT match the expected value"))
 
@@ -102,6 +109,16 @@ def main(argv=None) -> int:
 
     section("householder_product second-order derivative (t=0.7)")
     c = report["householder_product_second_order_case"]
+    print_fields(
+        [
+            ("expected", f"{c['expected_second_order']!s}"),
+            ("forward-over-forward jvp (buggy)", f"{c['forward_over_forward_jvp']!s}"),
+            ("guard (reverse-over-reverse)", f"{c['guard_reverse_over_reverse']!s}"),
+        ]
+    )
+
+    section("layer_norm second-order derivative (t=0.7)")
+    c = report["layer_norm_second_order_case"]
     print_fields(
         [
             ("expected", f"{c['expected_second_order']!s}"),

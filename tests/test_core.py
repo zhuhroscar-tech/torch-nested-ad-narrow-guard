@@ -30,6 +30,7 @@ from torch_nested_ad_narrow_guard.core import (
     diagnose,
     safe_nested_slogdet_second_order_jvp,
     safe_nested_householder_product_second_order_jvp,
+    safe_layer_norm_second_order_jvp,
     safe_jagged_narrow_unbind,
     safe_jagged_padded_transform,
 )
@@ -38,6 +39,7 @@ from torch_nested_ad_narrow_guard.core import (
 EXPECTED_SECOND_ORDER = -0.17853600476096013
 EXPECTED_NARROW_SUM = 7 * 0.7
 EXPECTED_HOUSEHOLDER_SECOND_ORDER = 1.556251320682393
+EXPECTED_LAYER_NORM_SECOND_ORDER = 0.7749142079590942
 
 
 def _slogdet_f(t):
@@ -52,6 +54,16 @@ def _householder_f(t):
     a = torch.stack((c, t)).reshape(2, 1)
     tau = (2 / (1 + t * t)).reshape(1)
     return torch.linalg.householder_product(a, tau).sum()
+
+
+def _layer_norm_f(t):
+    zero = torch.zeros((), dtype=t.dtype)
+    x = torch.stack((t, zero)).reshape(1, 2)
+    weight = torch.tensor([1, 2], dtype=t.dtype)
+    bias = torch.zeros((2,), dtype=t.dtype)
+    return torch.nn.functional.layer_norm(
+        x, normalized_shape=[2], weight=weight, bias=bias, eps=0.25
+    ).sum()
 
 
 class TestNativeBugReproduction:
@@ -193,6 +205,58 @@ class TestBugInjectionNonTautological:
         d2 = (f_closed(t0 + h) - 2 * f_closed(t0) + f_closed(t0 - h)) / (h * h)
         assert abs(d2 - EXPECTED_HOUSEHOLDER_SECOND_ORDER) < 1e-4
 
+    def test_layer_norm_nested_jvp_silently_wrong_sign_on_this_host(self):
+        # Exact repro from pytorch/pytorch#196700's issue body.
+        import torch.func as tfunc
+
+        t0 = torch.tensor(0.7, dtype=torch.float64)
+
+        def jvp1(t):
+            return tfunc.jvp(_layer_norm_f, (t,), (torch.ones_like(t),))[1]
+
+        _, actual = tfunc.jvp(jvp1, (t0,), (torch.ones_like(t0),))
+        # This is a genuine defect check: if a future torch release
+        # fixes #196700, this assertion should start failing loudly
+        # (not silently), signaling the guard workaround can be
+        # retired for this op.
+        assert abs(actual.item() - EXPECTED_LAYER_NORM_SECOND_ORDER) > 1e-3, (
+            "forward-over-forward nested JVP now matches the expected "
+            "value -- pytorch/pytorch#196700 may be fixed upstream; "
+            "re-evaluate whether safe_layer_norm_second_order_jvp is "
+            "still needed."
+        )
+
+    def test_layer_norm_forward_over_reverse_is_also_silently_wrong(self):
+        # Same non-tautology check as the slogdet/householder cases:
+        # merely swapping torch.func transform order (grad-of-jvp
+        # instead of jvp-of-jvp) does NOT fix layer_norm either -- both
+        # wrong paths return the identical wrong-sign value.
+        import torch.func as tfunc
+
+        t0 = torch.tensor(0.7, dtype=torch.float64)
+
+        def jvp1(t):
+            return tfunc.jvp(_layer_norm_f, (t,), (torch.ones_like(t),))[1]
+
+        for_rev = tfunc.grad(jvp1)(t0)
+        assert abs(for_rev.item() - EXPECTED_LAYER_NORM_SECOND_ORDER) > 1e-3, (
+            "forward-over-reverse now matches expected -- re-evaluate "
+            "whether swapping transform order alone would suffice"
+        )
+
+    def test_layer_norm_independent_finite_difference_oracle_confirms_expected(self):
+        # Independent oracle computed via central finite differences on
+        # the closed-form scalar expression f(t) = -t / sqrt(1 + t**2)
+        # -- never calls torch.func, torch.nn.functional, or any guard
+        # code path, so it cannot share a bug with what it is checking.
+        def f_closed(t):
+            return -t / (1 + t * t) ** 0.5
+
+        h = 1e-4
+        t0 = 0.7
+        d2 = (f_closed(t0 + h) - 2 * f_closed(t0) + f_closed(t0 - h)) / (h * h)
+        assert abs(d2 - EXPECTED_LAYER_NORM_SECOND_ORDER) < 1e-4
+
 
 class TestGuardMatchesExpected:
     def test_safe_nested_slogdet_second_order_jvp_matches_expected(self):
@@ -235,6 +299,27 @@ class TestGuardMatchesExpected:
 
         t0 = torch.tensor(t0_val, dtype=torch.float64)
         guard_result = safe_nested_householder_product_second_order_jvp(_householder_f, t0)
+        assert abs(guard_result.item() - oracle) < 1e-4
+
+    def test_safe_layer_norm_second_order_jvp_matches_expected(self):
+        t0 = torch.tensor(0.7, dtype=torch.float64)
+        result = safe_layer_norm_second_order_jvp(_layer_norm_f, t0)
+        assert abs(result.item() - EXPECTED_LAYER_NORM_SECOND_ORDER) < 1e-9
+
+    def test_safe_layer_norm_matches_finite_difference_oracle(self):
+        # Independent oracle: central finite difference on the
+        # closed-form scalar expression, computed without any
+        # torch.func or torch.nn.functional call, so it cannot share a
+        # bug with the guard.
+        def f_closed(t):
+            return -t / (1 + t * t) ** 0.5
+
+        h = 1e-4
+        t0_val = 0.7
+        oracle = (f_closed(t0_val + h) - 2 * f_closed(t0_val) + f_closed(t0_val - h)) / (h * h)
+
+        t0 = torch.tensor(t0_val, dtype=torch.float64)
+        guard_result = safe_layer_norm_second_order_jvp(_layer_norm_f, t0)
         assert abs(guard_result.item() - oracle) < 1e-4
 
     def test_safe_jagged_narrow_unbind_matches_expected(self):
@@ -327,6 +412,7 @@ class TestDiagnose:
         assert isinstance(report["torch_version"], str)
         assert "slogdet_second_order_case" in report
         assert "householder_product_second_order_case" in report
+        assert "layer_norm_second_order_case" in report
         assert "jagged_narrow_unbind_case" in report
         assert "jagged_padded_transform_case" in report
 
@@ -338,6 +424,10 @@ class TestDiagnose:
         )
         assert report["householder_bug_reproduced"] is True, (
             "expected the householder_product nested-JVP bug to "
+            f"reproduce on torch {report['torch_version']}"
+        )
+        assert report["layer_norm_bug_reproduced"] is True, (
+            "expected the layer_norm nested-JVP bug to "
             f"reproduce on torch {report['torch_version']}"
         )
         assert report["narrow_bug_reproduced"] is True, (

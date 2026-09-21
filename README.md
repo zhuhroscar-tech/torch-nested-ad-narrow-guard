@@ -1,6 +1,6 @@
 # torch-nested-ad-narrow-guard
 
-Diagnoses and guards four real, independently-reproduced correctness bugs
+Diagnoses and guards five real, independently-reproduced correctness bugs
 in PyTorch (torch 2.14.0 confirmed on this host, macOS arm64 CPU):
 
 ## Bug 1 — nested forward-mode AD silently zeros a slogdet second derivative
@@ -189,6 +189,55 @@ reverse is verified correct for this op.
 `safe_nested_householder_product_second_order_jvp(f, t)` reuses the
 same reverse-over-reverse pattern as Bug 1's guard and is verified to
 match the finite-difference oracle to `1e-9`.
+
+## Bug 5 — nested forward-mode AD also silently wrong-sign for layer_norm's second derivative
+
+**Upstream issue:** [pytorch/pytorch#196700](https://github.com/pytorch/pytorch/issues/196700) (open)
+
+The same failure class as Bugs 1 and 4, but a third distinct op
+(`torch.nn.functional.layer_norm`), found independently while
+scouting PyTorch's `module: correctness (silent)` label. Unlike Bugs
+1 and 4, this is not merely a magnitude error — the nested-JVP result
+has the **wrong sign**.
+
+Exact repro (from the issue, reproduced verbatim on this host):
+
+```python
+import torch
+dtype = torch.float64
+def f(t):
+    zero = torch.zeros((), dtype=t.dtype)
+    x = torch.stack((t, zero)).reshape(1, 2)
+    weight = torch.tensor([1, 2], dtype=t.dtype)
+    bias = torch.zeros((2,), dtype=t.dtype)
+    return torch.nn.functional.layer_norm(
+        x, normalized_shape=[2], weight=weight, bias=bias, eps=0.25
+    ).sum()
+def jvp1(t):
+    return torch.func.jvp(f, (t,), (torch.ones_like(t),))[1]
+t = torch.tensor(0.7, dtype=dtype)
+_, actual = torch.func.jvp(jvp1, (t,), (torch.ones_like(t),))
+# actual   = -0.38487405661968344
+# expected = 0.7749142079590942
+```
+
+Independently cross-checked against a central finite difference on
+the closed-form `f(t) = -t / sqrt(1 + t**2)` (the scalar output
+simplifies algebraically, computed here with plain Python floats, no
+autograd at all): `0.774914199475063`, matching the analytic value to
+~1e-7 — confirming the expected value itself, not just the buggy path.
+
+| Method | Result on this host |
+|---|---|
+| forward-over-forward (`jvp` of `jvp`) — **buggy** | `-0.38487405661968344` |
+| forward-over-reverse (`grad` of `jvp`) — **also buggy** | `-0.3848740566196835` |
+| reverse-over-forward (`jvp` of `grad`) | raises `RuntimeError` (functorch transform restriction, same as Bug 4) |
+| reverse-over-reverse (`autograd.grad(create_graph=True)` twice) | `0.7749142079590943` ✅ |
+| central finite difference (independent oracle) | `0.774914199475063` ✅ (matches to ~1e-7) |
+
+`safe_layer_norm_second_order_jvp(f, t)` reuses the same
+reverse-over-reverse pattern as Bugs 1 and 4's guards and is verified
+to match the finite-difference oracle to `1e-9`.
 
 ## Install
 

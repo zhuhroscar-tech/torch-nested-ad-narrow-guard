@@ -94,6 +94,29 @@ issue links.
    to complete. Verified on this host to (a) complete backward without
    raising, and (b) produce forward values that exactly match a
    no-grad reference computed the same way.
+
+5. pytorch/pytorch#196700 -- nested (second-order) forward-mode AD via
+   ``torch.func.jvp(jvp1, ...)`` ALSO silently returns the WRONG-SIGN
+   value for ``torch.nn.functional.layer_norm``'s second derivative --
+   the same failure class as bugs 1 and 4 (#196697, #196698), a third
+   distinct op, found independently during this fleet's external OSS
+   scouting rather than sourced from bug 1's own issue thread.
+   Reproduced verbatim on this host: expected 0.7749142079590942
+   (cross-checked against an independent central-finite-difference
+   oracle computed directly on the closed-form scalar expression
+   ``-t / sqrt(1 + t**2)`` with no autograd involved at all, giving
+   0.774914199475063, matching to ~1e-7), forward-over-forward
+   (jvp-of-jvp) actually returns -0.38487405661968344 -- not merely a
+   magnitude error but the WRONG SIGN. Forward-over-reverse (grad-of-
+   jvp) is ALSO wrong (-0.3848740566196835, same wrong value);
+   reverse-over-forward (jvp-of-grad) raises the same functorch-
+   transform RuntimeError as bug 4's reverse-over-forward attempt.
+   Only reverse-over-reverse (``torch.autograd.grad(create_graph=True)``
+   twice) is verified correct here (0.7749142079590943, matching the
+   finite-difference oracle to ~1e-13).
+
+   ``safe_layer_norm_second_order_jvp`` reuses the same verified
+   reverse-over-reverse pattern as bugs 1 and 4's guards.
 """
 from __future__ import annotations
 
@@ -156,6 +179,34 @@ def safe_nested_householder_product_second_order_jvp(f, t):
     to ~1e-9 for the householder_product case that nested forward-mode
     AD gets wrong (both forward-over-forward AND forward-over-reverse
     are wrong for this op too -- see README).
+
+    ``t`` must be a scalar tensor; ``f`` must be differentiable via
+    ``torch.autograd`` (i.e. must not itself require ``torch.func``
+    transforms internally).
+    """
+    torch_module = _import_torch()
+    t_req = t.clone().detach().requires_grad_(True)
+    y = f(t_req)
+    (g1,) = torch_module.autograd.grad(y, t_req, create_graph=True)
+    (g2,) = torch_module.autograd.grad(g1, t_req)
+    return g2.detach()
+
+
+def safe_layer_norm_second_order_jvp(f, t):
+    """Compute the second derivative of a scalar function ``f`` (which
+    internally uses ``torch.nn.functional.layer_norm``) at scalar
+    tensor ``t``, avoiding the silently-wrong (wrong-sign) result that
+    nested forward-mode AD (``torch.func.jvp`` of ``torch.func.jvp``)
+    produces for this op (pytorch/pytorch#196700 -- the same failure
+    class as #196697/#196698, but a distinct op discovered
+    independently during fleet maintenance).
+
+    Uses reverse-over-reverse differentiation (``torch.autograd.grad``
+    with ``create_graph=True``, called twice), which was independently
+    verified on this host to match a central-finite-difference oracle
+    to ~1e-7 for the layer_norm case that nested forward-mode AD gets
+    wrong (both forward-over-forward AND forward-over-reverse return
+    the identical wrong-sign value for this op -- see README).
 
     ``t`` must be a scalar tensor; ``f`` must be differentiable via
     ``torch.autograd`` (i.e. must not itself require ``torch.func``
@@ -337,6 +388,57 @@ def _run_householder_case(torch_module) -> HouseholderProductSecondOrderCase:
 
 
 @dataclasses.dataclass
+class LayerNormSecondOrderCase:
+    t_value: float
+    expected_second_order: float
+    forward_over_forward_jvp: float  # the buggy path (#196700)
+    forward_over_forward_matches_expected: bool
+    guard_reverse_over_reverse: float
+    guard_matches_expected: bool
+
+
+def _run_layer_norm_case(torch_module) -> LayerNormSecondOrderCase:
+    import torch.func as tfunc
+
+    dtype = torch_module.float64
+
+    def f(t):
+        zero = torch_module.zeros((), dtype=t.dtype)
+        x = torch_module.stack((t, zero)).reshape(1, 2)
+        weight = torch_module.tensor([1, 2], dtype=t.dtype)
+        bias = torch_module.zeros((2,), dtype=t.dtype)
+        return torch_module.nn.functional.layer_norm(
+            x, normalized_shape=[2], weight=weight, bias=bias, eps=0.25
+        ).sum()
+
+    t0 = torch_module.tensor(0.7, dtype=dtype)
+    # Independent oracle: closed-form f(t) = -t / sqrt(1 + t**2) (the
+    # scalar output simplifies algebraically); expected value is this
+    # function's exact analytic second derivative at t=0.7, cross-
+    # checked against a central finite difference on the closed form
+    # with no autograd involved at all (see README/ledger).
+    expected = 0.7749142079590942
+
+    # Buggy path: forward-over-forward via nested torch.func.jvp.
+    def jvp1(t):
+        return tfunc.jvp(f, (t,), (torch_module.ones_like(t),))[1]
+
+    _, fof_actual = tfunc.jvp(jvp1, (t0,), (torch_module.ones_like(t0),))
+    fof_val = float(fof_actual.item())
+
+    guard_val = float(safe_layer_norm_second_order_jvp(f, t0).item())
+
+    return LayerNormSecondOrderCase(
+        t_value=0.7,
+        expected_second_order=expected,
+        forward_over_forward_jvp=fof_val,
+        forward_over_forward_matches_expected=abs(fof_val - expected) < 1e-6,
+        guard_reverse_over_reverse=guard_val,
+        guard_matches_expected=abs(guard_val - expected) < 1e-6,
+    )
+
+
+@dataclasses.dataclass
 class JaggedNarrowCase:
     t_value: float
     expected_sum: float
@@ -448,7 +550,7 @@ def _run_jagged_padded_transform_case(torch_module) -> JaggedPaddedTransformCase
 
 
 def diagnose() -> Dict[str, Any]:
-    """Reproduce all four upstream bugs from scratch against the
+    """Reproduce all five upstream bugs from scratch against the
     currently installed torch build, using the EXACT repro code from
     the issues, and verify the guard functions produce the
     mathematically correct result instead. Never trusts a cached/prior
@@ -457,6 +559,7 @@ def diagnose() -> Dict[str, Any]:
 
     slogdet_case = _run_slogdet_case(torch_module)
     householder_case = _run_householder_case(torch_module)
+    layer_norm_case = _run_layer_norm_case(torch_module)
     narrow_case = _run_jagged_narrow_case(torch_module)
     padded_transform_case = _run_jagged_padded_transform_case(torch_module)
 
@@ -467,18 +570,22 @@ def diagnose() -> Dict[str, Any]:
             "https://github.com/pytorch/pytorch/issues/196708",
             "https://github.com/pytorch/pytorch/issues/145837",
             "https://github.com/pytorch/pytorch/issues/196698",
+            "https://github.com/pytorch/pytorch/issues/196700",
         ],
         "slogdet_second_order_case": dataclasses.asdict(slogdet_case),
         "householder_product_second_order_case": dataclasses.asdict(householder_case),
+        "layer_norm_second_order_case": dataclasses.asdict(layer_norm_case),
         "jagged_narrow_unbind_case": dataclasses.asdict(narrow_case),
         "jagged_padded_transform_case": dataclasses.asdict(padded_transform_case),
         "slogdet_bug_reproduced": not slogdet_case.forward_over_forward_matches_expected,
         "householder_bug_reproduced": not householder_case.forward_over_forward_matches_expected,
+        "layer_norm_bug_reproduced": not layer_norm_case.forward_over_forward_matches_expected,
         "narrow_bug_reproduced": not narrow_case.buggy_matches_expected,
         "padded_transform_bug_reproduced": padded_transform_case.backward_raised_on_buggy_path,
         "guards_fully_correct": (
             slogdet_case.guard_matches_expected
             and householder_case.guard_matches_expected
+            and layer_norm_case.guard_matches_expected
             and narrow_case.guard_matches_expected
             and padded_transform_case.guard_backward_succeeded
             and padded_transform_case.guard_forward_matches_reference

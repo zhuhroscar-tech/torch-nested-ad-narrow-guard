@@ -28,6 +28,7 @@ def _fake_report(**overrides):
         "torch_version": "9.9.9-fake",
         "slogdet_bug_reproduced": False,
         "householder_bug_reproduced": False,
+        "layer_norm_bug_reproduced": False,
         "narrow_bug_reproduced": False,
         "padded_transform_bug_reproduced": False,
         "guards_fully_correct": True,
@@ -37,6 +38,11 @@ def _fake_report(**overrides):
             "guard_reverse_over_reverse": 1.0,
         },
         "householder_product_second_order_case": {
+            "expected_second_order": 1.0,
+            "forward_over_forward_jvp": 1.0,
+            "guard_reverse_over_reverse": 1.0,
+        },
+        "layer_norm_second_order_case": {
             "expected_second_order": 1.0,
             "forward_over_forward_jvp": 1.0,
             "guard_reverse_over_reverse": 1.0,
@@ -129,22 +135,24 @@ def test_torch_unavailable_text_mode_reports_fail_headline_and_exit_2(monkeypatc
 
 def test_no_bugs_present_prints_all_four_info_lines(monkeypatch, capsys):
     """cli.py lines 68, 73, 78, 83-ish: the 'info' (not 'warn') branch
-    for each of the four tracked bugs when none reproduce on this host."""
+    for each of the tracked bugs when none reproduce on this host."""
     monkeypatch.setattr(core, "diagnose", lambda: _fake_report())
     main(["--no-color"])
     out = capsys.readouterr().out
     assert "slogdet nested-JVP bug did not reproduce" in out
     assert "householder_product nested-JVP bug did not reproduce" in out
+    assert "layer_norm nested-JVP bug did not reproduce" in out
     assert "narrow+unbind bug did not reproduce" in out
     assert "padded<->jagged roundtrip bug did not reproduce" in out
     assert "slogdet second-derivative bug reproduced" not in out
     assert "householder_product second-derivative bug reproduced" not in out
+    assert "layer_norm second-derivative bug reproduced" not in out
     assert "narrow+unbind element-selection bug reproduced" not in out
     assert "padded<->jagged roundtrip breaks backward pass" not in out
 
 
 def test_all_bugs_present_prints_all_four_warn_lines(monkeypatch, capsys):
-    """Positive-branch companion: when all four bugs ARE reproduced,
+    """Positive-branch companion: when all tracked bugs ARE reproduced,
     the 'warn' headlines fire instead."""
     monkeypatch.setattr(
         core,
@@ -152,6 +160,7 @@ def test_all_bugs_present_prints_all_four_warn_lines(monkeypatch, capsys):
         lambda: _fake_report(
             slogdet_bug_reproduced=True,
             householder_bug_reproduced=True,
+            layer_norm_bug_reproduced=True,
             narrow_bug_reproduced=True,
             padded_transform_bug_reproduced=True,
         ),
@@ -160,6 +169,7 @@ def test_all_bugs_present_prints_all_four_warn_lines(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "slogdet second-derivative bug reproduced" in out
     assert "householder_product second-derivative bug reproduced" in out
+    assert "layer_norm second-derivative bug reproduced" in out
     assert "narrow+unbind element-selection bug reproduced" in out
     assert "padded<->jagged roundtrip breaks backward pass" in out
 
