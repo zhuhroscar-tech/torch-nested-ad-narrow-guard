@@ -1,6 +1,6 @@
 # torch-nested-ad-narrow-guard
 
-诊断并规避 PyTorch 中四个真实存在、已在本机独立复现的正确性缺陷
+诊断并规避 PyTorch 中五个真实存在、已在本机独立复现的正确性缺陷
 （本机验证环境：torch 2.14.0，macOS arm64 CPU）：
 
 ## 缺陷一 —— 嵌套前向模式自动微分静默将 slogdet 二阶导数归零
@@ -89,6 +89,34 @@ index 0 - got [4, j21, 64] but expected shape compatible with [4, j20, 64]
 `safe_nested_householder_product_second_order_jvp(f, t)` 复用与
 缺陷一相同的反向套反向微分方式，已验证与中心差分核验值的误差小于
 `1e-9`。
+
+## 缺陷五 —— 嵌套前向模式自动微分对 layer_norm 二阶导数同样静默出错（符号错误）
+
+**上游 issue：** [pytorch/pytorch#196700](https://github.com/pytorch/pytorch/issues/196700)（open）
+
+与缺陷一、缺陷四相同的故障类型，作用于第三个不同的算子
+（`torch.nn.functional.layer_norm`），同样是在扫描 PyTorch 的
+`module: correctness (silent)` 标签时独立发现的。与缺陷一、四不同的
+是：这里不只是数值大小错误——嵌套 JVP 结果的**符号是反的**。
+
+按 issue 原文精确复现（已在本机验证）：期望值 `0.7749142079590942`，
+实际返回 `-0.38487405661968344`（符号相反且数值也不同）。
+
+另外用闭式表达式 `f(t) = -t / sqrt(1 + t**2)` 的中心差分独立核验
+（纯 Python 浮点数计算，不涉及任何自动微分），得到
+`0.774914199475063`，与解析值误差约 `1e-7`，确认了期望值本身的
+正确性。
+
+| 方法 | 本机结果 |
+|---|---|
+| 前向套前向（`jvp` 套 `jvp`）—— **有缺陷** | `-0.38487405661968344` |
+| 前向套反向（`grad` 套 `jvp`）—— **同样有缺陷** | `-0.3848740566196835` |
+| 反向套前向（`jvp` 套 `grad`）| 抛出 `RuntimeError`（functorch 变换限制，与缺陷四相同）|
+| 反向套反向（两次 `torch.autograd.grad(create_graph=True)`）| `0.7749142079590943` ✅ |
+| 中心差分（独立参考值）| `0.774914199475063` ✅（误差约 `1e-7`）|
+
+`safe_layer_norm_second_order_jvp(f, t)` 复用与缺陷一、四相同的
+反向套反向微分方式，已验证与中心差分核验值的误差小于 `1e-9`。
 
 ## 安装
 
