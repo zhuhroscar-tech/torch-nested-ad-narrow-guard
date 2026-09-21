@@ -1,5 +1,5 @@
 """torch-nested-ad-narrow-guard: version and package marker."""
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from .core import (
     safe_nested_slogdet_second_order_jvp,
@@ -7,5 +7,6 @@ from .core import (
     safe_layer_norm_second_order_jvp,
     safe_jagged_narrow_unbind,
     safe_jagged_padded_transform,
+    safe_autograd_function_higher_order_derivative,
     diagnose,
 )  # noqa: F401

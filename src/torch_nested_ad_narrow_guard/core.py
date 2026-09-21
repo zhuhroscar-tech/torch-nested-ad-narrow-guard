@@ -117,6 +117,38 @@ issue links.
 
    ``safe_layer_norm_second_order_jvp`` reuses the same verified
    reverse-over-reverse pattern as bugs 1 and 4's guards.
+
+6. pytorch/pytorch#197867 -- ``torch.func.jacfwd`` chained through a
+   THIRD-order derivative (``jacfwd(jacfwd(jacfwd(f)))``) silently
+   returns 0.0 for the 2nd and 3rd derivatives whenever ``f`` routes
+   through a custom ``torch.autograd.Function`` that defines a
+   ``jvp`` staticmethod (the officially documented way to make a
+   custom autograd.Function forward-mode-AD compatible) -- a
+   DIFFERENT failure trigger than bugs 1/4/5 above (those need
+   ``torch.func.jvp`` literally nested inside another ``jvp``; this
+   one needs ``jacfwd`` chained three deep through a custom Function,
+   and does not require calling ``torch.func.jvp`` directly at all).
+   Independently reproduced on this host (torch 2.14.0): for
+   ``f(x) = Square.apply(Square.apply(x))`` (mathematically ``x**4``,
+   where ``Square`` is a minimal custom autograd.Function with a
+   correct analytic ``jvp``), plain tensor ops give derivatives
+   ``[108.0, 108.0, 72.0]`` at ``x=3``; the custom-Function version
+   gives ``[108.0, 0.0, 0.0]`` -- the first derivative is right, the
+   second and third silently collapse to zero. Reverse-over-forward
+   (``jacrev`` of ``jacfwd``) gives the correct first-order value but
+   was NOT independently re-checked for order 2/3 by this guard (out
+   of scope; see README for what was and was not tested).
+
+   ``safe_autograd_function_higher_order_derivative`` avoids
+   ``torch.func.jacfwd``/``jvp`` (forward-mode AD) entirely for this
+   case: it computes the requested derivative order via ``order``
+   chained calls to ``torch.autograd.grad(..., create_graph=True)``
+   (reverse-mode only), which was independently verified on this host
+   to reproduce the correct ``[108.0, 108.0, 72.0]`` sequence for both
+   the plain-ops function AND the custom-Function version -- proving
+   the bug is specific to forward-mode AD through the custom
+   Function's ``jvp`` path, not a fundamental limitation of computing
+   third derivatives of this function at all.
 """
 from __future__ import annotations
 
@@ -259,6 +291,39 @@ def safe_jagged_narrow_unbind(dense_x, dim: int, starts, lengths):
         s, l = starts_list[i], lengths_list[i]
         rows.append(dense_x[i, s : s + l].clone())
     return rows
+
+
+def safe_autograd_function_higher_order_derivative(f, x, order: int):
+    """Compute the ``order``-th derivative of scalar-output function ``f``
+    at tensor ``x``, avoiding the silently-wrong-zero result that
+    ``torch.func.jacfwd`` chained ``order`` times deep produces when
+    ``f`` routes through a custom ``torch.autograd.Function`` defining
+    a ``jvp`` staticmethod (pytorch/pytorch#197867).
+
+    Uses ``order`` chained calls to ``torch.autograd.grad`` with
+    ``create_graph=True`` (pure reverse-mode AD, never forward-mode),
+    which was independently verified on this host to reproduce the
+    correct derivative sequence for both a plain-tensor-ops function
+    and an equivalent function built from a custom autograd.Function
+    with a correct analytic ``jvp`` -- proving the upstream bug is
+    specific to nested ``jacfwd``/forward-mode AD through the custom
+    Function path, not a fundamental limitation of the underlying
+    math.
+
+    ``x`` must be a tensor with ``requires_grad=True`` (or will be
+    cloned and have it set); ``f`` must return a scalar (0-dim or
+    single-element) tensor. ``order`` must be a positive integer.
+    """
+    torch_module = _import_torch()
+    if order < 1:
+        raise ValueError(f"order must be >= 1, got {order}")
+
+    x_req = x.clone().detach().requires_grad_(True)
+    current = f(x_req)
+    for i in range(order):
+        create_graph = i < order - 1
+        (current,) = torch_module.autograd.grad(current, x_req, create_graph=create_graph)
+    return current.detach()
 
 
 def safe_jagged_padded_transform(nested_x, transform_fn):
@@ -549,8 +614,77 @@ def _run_jagged_padded_transform_case(torch_module) -> JaggedPaddedTransformCase
     )
 
 
+@dataclasses.dataclass
+class AutogradFunctionHigherOrderCase:
+    x_value: float
+    expected_derivatives: List[float]  # [order1, order2, order3] for pure ops
+    custom_function_jacfwd_chain: List[float]  # the buggy path (#197867)
+    custom_function_jacfwd_matches_expected: bool
+    guard_reverse_mode_chain: List[float]
+    guard_matches_expected: bool
+
+
+def _run_autograd_function_higher_order_case(torch_module) -> AutogradFunctionHigherOrderCase:
+    import torch.func as tfunc
+
+    class Square(torch_module.autograd.Function):
+        generate_vmap_rule = True
+
+        @staticmethod
+        def forward(x):
+            return x * x
+
+        @staticmethod
+        def setup_context(ctx, inputs, output):
+            ctx.save_for_backward(*inputs)
+            ctx.save_for_forward(*inputs)
+
+        @staticmethod
+        def backward(ctx, g):
+            (x,) = ctx.saved_tensors
+            return 2 * x * g
+
+        @staticmethod
+        def jvp(ctx, dx):
+            (x,) = ctx.saved_tensors
+            return 2 * x * dx
+
+    def custom(x):
+        return Square.apply(Square.apply(x)).sum()
+
+    x0 = torch_module.tensor([3.0], dtype=torch_module.float64)
+    # Exact analytic derivatives of x**4 at x=3: 108, 108, 72.
+    expected = [108.0, 108.0, 72.0]
+
+    # Buggy path: torch.func.jacfwd chained three deep through the
+    # custom autograd.Function.
+    derivative = custom
+    buggy_values: List[float] = []
+    for _ in range(3):
+        derivative = tfunc.jacfwd(derivative)
+        buggy_values.append(float(derivative(x0).item()))
+
+    guard_values = [
+        float(safe_autograd_function_higher_order_derivative(custom, x0, order).item())
+        for order in (1, 2, 3)
+    ]
+
+    return AutogradFunctionHigherOrderCase(
+        x_value=3.0,
+        expected_derivatives=expected,
+        custom_function_jacfwd_chain=buggy_values,
+        custom_function_jacfwd_matches_expected=all(
+            abs(a - b) < 1e-6 for a, b in zip(buggy_values, expected)
+        ),
+        guard_reverse_mode_chain=guard_values,
+        guard_matches_expected=all(
+            abs(a - b) < 1e-6 for a, b in zip(guard_values, expected)
+        ),
+    )
+
+
 def diagnose() -> Dict[str, Any]:
-    """Reproduce all five upstream bugs from scratch against the
+    """Reproduce all six upstream bugs from scratch against the
     currently installed torch build, using the EXACT repro code from
     the issues, and verify the guard functions produce the
     mathematically correct result instead. Never trusts a cached/prior
@@ -562,6 +696,7 @@ def diagnose() -> Dict[str, Any]:
     layer_norm_case = _run_layer_norm_case(torch_module)
     narrow_case = _run_jagged_narrow_case(torch_module)
     padded_transform_case = _run_jagged_padded_transform_case(torch_module)
+    higher_order_case = _run_autograd_function_higher_order_case(torch_module)
 
     return {
         "torch_version": torch_module.__version__,
@@ -571,17 +706,22 @@ def diagnose() -> Dict[str, Any]:
             "https://github.com/pytorch/pytorch/issues/145837",
             "https://github.com/pytorch/pytorch/issues/196698",
             "https://github.com/pytorch/pytorch/issues/196700",
+            "https://github.com/pytorch/pytorch/issues/197867",
         ],
         "slogdet_second_order_case": dataclasses.asdict(slogdet_case),
         "householder_product_second_order_case": dataclasses.asdict(householder_case),
         "layer_norm_second_order_case": dataclasses.asdict(layer_norm_case),
         "jagged_narrow_unbind_case": dataclasses.asdict(narrow_case),
         "jagged_padded_transform_case": dataclasses.asdict(padded_transform_case),
+        "autograd_function_higher_order_case": dataclasses.asdict(higher_order_case),
         "slogdet_bug_reproduced": not slogdet_case.forward_over_forward_matches_expected,
         "householder_bug_reproduced": not householder_case.forward_over_forward_matches_expected,
         "layer_norm_bug_reproduced": not layer_norm_case.forward_over_forward_matches_expected,
         "narrow_bug_reproduced": not narrow_case.buggy_matches_expected,
         "padded_transform_bug_reproduced": padded_transform_case.backward_raised_on_buggy_path,
+        "autograd_function_higher_order_bug_reproduced": (
+            not higher_order_case.custom_function_jacfwd_matches_expected
+        ),
         "guards_fully_correct": (
             slogdet_case.guard_matches_expected
             and householder_case.guard_matches_expected
@@ -589,5 +729,6 @@ def diagnose() -> Dict[str, Any]:
             and narrow_case.guard_matches_expected
             and padded_transform_case.guard_backward_succeeded
             and padded_transform_case.guard_forward_matches_reference
+            and higher_order_case.guard_matches_expected
         ),
     }

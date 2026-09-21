@@ -31,6 +31,7 @@ def _fake_report(**overrides):
         "layer_norm_bug_reproduced": False,
         "narrow_bug_reproduced": False,
         "padded_transform_bug_reproduced": False,
+        "autograd_function_higher_order_bug_reproduced": False,
         "guards_fully_correct": True,
         "slogdet_second_order_case": {
             "expected_second_order": 1.0,
@@ -56,6 +57,11 @@ def _fake_report(**overrides):
             "backward_raised_on_buggy_path": False,
             "guard_backward_succeeded": True,
             "guard_forward_matches_reference": True,
+        },
+        "autograd_function_higher_order_case": {
+            "expected_derivatives": [108.0, 108.0, 72.0],
+            "custom_function_jacfwd_chain": [108.0, 108.0, 72.0],
+            "guard_reverse_mode_chain": [108.0, 108.0, 72.0],
         },
     }
     report.update(overrides)
@@ -144,6 +150,7 @@ def test_no_bugs_present_prints_all_four_info_lines(monkeypatch, capsys):
     assert "layer_norm nested-JVP bug did not reproduce" in out
     assert "narrow+unbind bug did not reproduce" in out
     assert "padded<->jagged roundtrip bug did not reproduce" in out
+    assert "jacfwd-chain-through-custom-Function bug did not reproduce" in out
     assert "slogdet second-derivative bug reproduced" not in out
     assert "householder_product second-derivative bug reproduced" not in out
     assert "layer_norm second-derivative bug reproduced" not in out
@@ -163,6 +170,7 @@ def test_all_bugs_present_prints_all_four_warn_lines(monkeypatch, capsys):
             layer_norm_bug_reproduced=True,
             narrow_bug_reproduced=True,
             padded_transform_bug_reproduced=True,
+            autograd_function_higher_order_bug_reproduced=True,
         ),
     )
     main(["--no-color"])
@@ -172,6 +180,7 @@ def test_all_bugs_present_prints_all_four_warn_lines(monkeypatch, capsys):
     assert "layer_norm second-derivative bug reproduced" in out
     assert "narrow+unbind element-selection bug reproduced" in out
     assert "padded<->jagged roundtrip breaks backward pass" in out
+    assert "jacfwd chained 3-deep through custom autograd.Function silently zeroes 2nd/3rd derivative" in out
 
 
 def test_guard_mismatch_prints_fail_line_and_exit_1(monkeypatch, capsys):

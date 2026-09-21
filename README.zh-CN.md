@@ -118,6 +118,42 @@ index 0 - got [4, j21, 64] but expected shape compatible with [4, j20, 64]
 `safe_layer_norm_second_order_jvp(f, t)` 复用与缺陷一、四相同的
 反向套反向微分方式，已验证与中心差分核验值的误差小于 `1e-9`。
 
+## 缺陷六 —— jacfwd 三层链式调用经过自定义 autograd.Function 时静默将高阶导数归零
+
+**上游 issue：** [pytorch/pytorch#197867](https://github.com/pytorch/pytorch/issues/197867)（open）
+
+与缺陷一、四、五不同的触发方式（那三个都需要 `torch.func.jvp`
+直接嵌套在另一个 `jvp` 内部）。这个缺陷需要将 `torch.func.jacfwd`
+链式调用三层，对一个经过自定义 `torch.autograd.Function`（定义了
+`jvp` 静态方法——这是官方文档推荐的让自定义 Function 兼容前向模式
+自动微分的方式）的函数求导。
+
+按 issue 原文精确复现（已在本机验证）：对于
+`custom(x) = Square.apply(Square.apply(x))`（数学上等价于
+`x**4`，`Square` 是一个 `jvp` 实现正确的最小自定义 Function），
+纯张量运算给出导数序列 `[108.0, 108.0, 72.0]`（x=3 处）；自定义
+Function 版本给出 `[108.0, 0.0, 0.0]`——一阶导数正确，二阶、三阶
+静默归零。
+
+| 方法 | x=3.0 处结果 |
+|---|---|
+| 纯张量运算 `((x*x)*(x*x)).sum()`，jacfwd 链式 | `[108.0, 108.0, 72.0]` ✅ |
+| 自定义 Function（`jvp` 解析正确），jacfwd 链式 —— **有缺陷** | `[108.0, 0.0, 0.0]` |
+| 自定义 Function，反向模式链式（重复调用 `autograd.grad(create_graph=True)`） | `[108.0, 108.0, 72.0]` ✅ |
+
+`safe_autograd_function_higher_order_derivative(f, x, order)`
+完全避开前向模式自动微分：通过 `order` 次链式调用
+`torch.autograd.grad(create_graph=True)`（纯反向模式）计算所需阶数
+的导数，已在本机验证：对纯张量运算函数和自定义 Function 版本都能
+正确复现 `[108.0, 108.0, 72.0]` 序列——证明该缺陷是自定义 Function
+的 `jvp` 路径下前向模式自动微分特有的问题，而非计算该函数三阶导数
+本身存在根本限制。
+
+**本规避方案未独立核验**：`jacrev`-of-`jacfwd`（反向套前向）在二、
+三阶下的表现，以及去掉 `generate_vmap_rule = True` 后缺陷是否依然
+存在。本次验证范围仅限于证明反向模式链式方案本身是正确的，并未
+穷尽所有会触发上游缺陷的求导阶数/组合。
+
 ## 安装
 
 ```bash
@@ -141,6 +177,10 @@ torch-nested-ad-narrow-guard --no-color
 - `safe_jagged_padded_transform` 要求 `transform_fn` 保持 padded
   张量的形状不变（`[batch, max_len, ...]` 进，同形状出），且仅支持
   沿序列长度维度（dim=1）重建，不支持改变批次大小或序列长度的变换。
+- `safe_autograd_function_higher_order_derivative` 要求 `f` 可被
+  `torch.autograd` 直接微分且返回标量，不支持仅兼容前向模式自动
+  微分的函数，也未穷尽所有会触发上游 #197867 的 jacfwd 链式深度/
+  vmap 规则组合，仅验证了 issue 原文的复现形态。
 - 这些是**规避方案**，不是上游修复。如果 PyTorch 未来修复了这些
   issue，本包自身的回归测试会失败——这是需要重新核实并更新本
   README 的信号，而非本包出现了退化。

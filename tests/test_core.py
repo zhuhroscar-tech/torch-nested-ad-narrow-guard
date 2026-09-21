@@ -33,6 +33,7 @@ from torch_nested_ad_narrow_guard.core import (
     safe_layer_norm_second_order_jvp,
     safe_jagged_narrow_unbind,
     safe_jagged_padded_transform,
+    safe_autograd_function_higher_order_derivative,
 )
 
 
@@ -226,6 +227,59 @@ class TestBugInjectionNonTautological:
             "still needed."
         )
 
+    def _make_square_autograd_function(self):
+        class Square(torch.autograd.Function):
+            generate_vmap_rule = True
+
+            @staticmethod
+            def forward(x):
+                return x * x
+
+            @staticmethod
+            def setup_context(ctx, inputs, output):
+                ctx.save_for_backward(*inputs)
+                ctx.save_for_forward(*inputs)
+
+            @staticmethod
+            def backward(ctx, g):
+                (x,) = ctx.saved_tensors
+                return 2 * x * g
+
+            @staticmethod
+            def jvp(ctx, dx):
+                (x,) = ctx.saved_tensors
+                return 2 * x * dx
+
+        return Square
+
+    def test_jacfwd_chain_through_custom_function_silently_zeroes_on_this_host(self):
+        # Exact repro from pytorch/pytorch#197867's issue body: x**4 via
+        # a custom autograd.Function with a correct analytic jvp.
+        import torch.func as tfunc
+
+        Square = self._make_square_autograd_function()
+
+        def custom(x):
+            return Square.apply(Square.apply(x)).sum()
+
+        x0 = torch.tensor([3.0], dtype=torch.float64)
+        derivative = custom
+        values = []
+        for _ in range(3):
+            derivative = tfunc.jacfwd(derivative)
+            values.append(derivative(x0).item())
+
+        assert values[0] == pytest.approx(108.0, abs=1e-6), (
+            "sanity: first derivative should be correct on this host"
+        )
+        assert abs(values[1]) < 1e-9 and abs(values[2]) < 1e-9, (
+            "expected the known bug (jacfwd chained through a custom "
+            "autograd.Function silently zeroes the 2nd/3rd derivative); "
+            "if this now fails, the bug may be fixed upstream "
+            "(pytorch/pytorch#197867) -- update the README/ledger "
+            "accordingly rather than treating this as a regression"
+        )
+
     def test_layer_norm_forward_over_reverse_is_also_silently_wrong(self):
         # Same non-tautology check as the slogdet/householder cases:
         # merely swapping torch.func transform order (grad-of-jvp
@@ -405,6 +459,71 @@ class TestGuardMatchesExpected:
 
         assert torch.allclose(out.values(), expected, atol=1e-6)
 
+    def test_safe_autograd_function_higher_order_derivative_matches_expected(self):
+        Square = self._make_square_autograd_function_module_level()
+
+        def custom(x):
+            return Square.apply(Square.apply(x)).sum()
+
+        x0 = torch.tensor([3.0], dtype=torch.float64)
+        expected = [108.0, 108.0, 72.0]
+        for order, exp in zip((1, 2, 3), expected):
+            result = safe_autograd_function_higher_order_derivative(custom, x0, order)
+            assert abs(result.item() - exp) < 1e-6
+
+    def test_safe_autograd_function_higher_order_derivative_matches_plain_ops_reference(self):
+        # Independent oracle: the same derivative order computed via
+        # reverse-mode chaining on a PLAIN tensor-ops function (no
+        # custom autograd.Function at all), so it cannot share the
+        # #197867 bug with what it is checking.
+        def pure(x):
+            return ((x * x) * (x * x)).sum()
+
+        Square = self._make_square_autograd_function_module_level()
+
+        def custom(x):
+            return Square.apply(Square.apply(x)).sum()
+
+        x0 = torch.tensor([3.0], dtype=torch.float64)
+        for order in (1, 2, 3):
+            pure_result = safe_autograd_function_higher_order_derivative(pure, x0, order)
+            custom_result = safe_autograd_function_higher_order_derivative(custom, x0, order)
+            assert abs(pure_result.item() - custom_result.item()) < 1e-6
+
+    def test_safe_autograd_function_higher_order_derivative_rejects_order_zero(self):
+        def pure(x):
+            return (x * x).sum()
+
+        x0 = torch.tensor([3.0], dtype=torch.float64)
+        with pytest.raises(ValueError):
+            safe_autograd_function_higher_order_derivative(pure, x0, 0)
+
+    @staticmethod
+    def _make_square_autograd_function_module_level():
+        class Square(torch.autograd.Function):
+            generate_vmap_rule = True
+
+            @staticmethod
+            def forward(x):
+                return x * x
+
+            @staticmethod
+            def setup_context(ctx, inputs, output):
+                ctx.save_for_backward(*inputs)
+                ctx.save_for_forward(*inputs)
+
+            @staticmethod
+            def backward(ctx, g):
+                (x,) = ctx.saved_tensors
+                return 2 * x * g
+
+            @staticmethod
+            def jvp(ctx, dx):
+                (x,) = ctx.saved_tensors
+                return 2 * x * dx
+
+        return Square
+
 
 class TestDiagnose:
     def test_diagnose_runs_and_reports_consistent_structure(self):
@@ -415,6 +534,7 @@ class TestDiagnose:
         assert "layer_norm_second_order_case" in report
         assert "jagged_narrow_unbind_case" in report
         assert "jagged_padded_transform_case" in report
+        assert "autograd_function_higher_order_case" in report
 
     def test_diagnose_reports_all_bugs_reproduced_on_this_host(self):
         report = diagnose()
@@ -436,6 +556,10 @@ class TestDiagnose:
         )
         assert report["padded_transform_bug_reproduced"] is True, (
             "expected the padded<->jagged roundtrip backward bug to "
+            f"reproduce on torch {report['torch_version']}"
+        )
+        assert report["autograd_function_higher_order_bug_reproduced"] is True, (
+            "expected the jacfwd-chain-through-custom-Function bug to "
             f"reproduce on torch {report['torch_version']}"
         )
 

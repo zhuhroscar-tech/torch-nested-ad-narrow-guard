@@ -239,6 +239,80 @@ autograd at all): `0.774914199475063`, matching the analytic value to
 reverse-over-reverse pattern as Bugs 1 and 4's guards and is verified
 to match the finite-difference oracle to `1e-9`.
 
+## Bug 6 — jacfwd chained three deep through a custom autograd.Function silently zeroes higher-order derivatives
+
+**Upstream issue:** [pytorch/pytorch#197867](https://github.com/pytorch/pytorch/issues/197867) (open)
+
+A different trigger than Bugs 1/4/5 above (those all need
+`torch.func.jvp` literally nested inside another `jvp`). This one
+needs `torch.func.jacfwd` chained three levels deep to differentiate
+a function that routes through a custom `torch.autograd.Function`
+defining a `jvp` staticmethod — the officially documented way to
+make a custom `Function` forward-mode-AD compatible.
+
+Exact repro (from the issue, reproduced verbatim on this host):
+
+```python
+import torch
+
+class Square(torch.autograd.Function):
+    generate_vmap_rule = True
+
+    @staticmethod
+    def forward(x):
+        return x * x
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        ctx.save_for_backward(*inputs)
+        ctx.save_for_forward(*inputs)
+
+    @staticmethod
+    def backward(ctx, g):
+        (x,) = ctx.saved_tensors
+        return 2 * x * g
+
+    @staticmethod
+    def jvp(ctx, dx):
+        (x,) = ctx.saved_tensors
+        return 2 * x * dx
+
+def custom(x):
+    return Square.apply(Square.apply(x)).sum()
+
+x = torch.tensor([3.0], dtype=torch.float64)
+derivative = custom
+for _ in range(3):
+    derivative = torch.func.jacfwd(derivative)
+    print(derivative(x).item())
+# prints 108.0, 0.0, 0.0
+# expected (matches plain x**4 ops): 108.0, 108.0, 72.0
+```
+
+| Method | Result at x=3.0 |
+|---|---|
+| plain tensor ops `((x*x)*(x*x)).sum()`, jacfwd chain | `[108.0, 108.0, 72.0]` ✅ |
+| custom `Function` (correct analytic `jvp`), jacfwd chain — **buggy** | `[108.0, 0.0, 0.0]` |
+| custom `Function`, reverse-mode chain (`autograd.grad(create_graph=True)` repeated) | `[108.0, 108.0, 72.0]` ✅ |
+
+`safe_autograd_function_higher_order_derivative(f, x, order)` avoids
+forward-mode AD entirely for this case: it computes the requested
+derivative order via `order` chained calls to
+`torch.autograd.grad(create_graph=True)` (pure reverse-mode), which
+was independently verified on this host to reproduce the correct
+`[108.0, 108.0, 72.0]` sequence for both the plain-ops function and
+the custom-`Function` version — proving the bug is specific to
+forward-mode AD through the custom `Function`'s `jvp` path, not a
+fundamental limitation of computing third derivatives of this
+function.
+
+**Not independently re-checked** by this guard: `jacrev`-of-`jacfwd`
+(reverse-over-forward) for orders 2/3, or whether the bug persists
+without `generate_vmap_rule = True`. Scope is limited to proving the
+reverse-mode-chain workaround is correct, not fully characterizing
+every differentiation-order combination that does or doesn't trigger
+the upstream bug.
+
 ## Install
 
 ```bash
@@ -263,6 +337,7 @@ from torch_nested_ad_narrow_guard import (
     safe_nested_householder_product_second_order_jvp,
     safe_jagged_narrow_unbind,
     safe_jagged_padded_transform,
+    safe_autograd_function_higher_order_derivative,
 )
 ```
 
@@ -280,12 +355,18 @@ from torch_nested_ad_narrow_guard import (
   the padded tensor's shape** (`[batch, max_len, ...]` in, same shape
   out) and only reconstructs along dim=1 (sequence length) — it does
   not support transforms that change batch size or sequence length.
+- **`safe_autograd_function_higher_order_derivative` requires `f` to
+  be autograd-differentiable and return a scalar** — it does not
+  support forward-mode-AD-only functions, and does not attempt to
+  characterize every jacfwd-chain-depth/vmap-rule combination that
+  triggers #197867 upstream, only the exact repro shape.
 - **These are workarounds, not upstream fixes.** If PyTorch fixes any
   of these issues in a future release, this package's own regression
   tests (`test_slogdet_nested_jvp_silently_returns_zero_on_this_host`,
   `test_householder_product_nested_jvp_silently_wrong_on_this_host`,
   `test_narrow_unbind_silently_includes_unselected_element_on_this_host`,
-  `test_padded_jagged_roundtrip_breaks_backward_on_this_host`)
+  `test_padded_jagged_roundtrip_breaks_backward_on_this_host`,
+  `test_jacfwd_chain_through_custom_function_silently_zeroes_on_this_host`)
   will start failing — that is the intended signal to re-check the
   issue and update this README, not a regression in this package.
 - **Verified on torch 2.14.0** (macOS arm64 CPU via local testing,

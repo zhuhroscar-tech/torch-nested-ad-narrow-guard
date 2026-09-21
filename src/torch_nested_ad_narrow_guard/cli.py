@@ -29,8 +29,12 @@ def main(argv=None) -> int:
             "second derivative (pytorch/pytorch#196700), (4) "
             "torch.nested.narrow(..., layout=torch.jagged) followed by "
             "unbind() silently includes an unselected element "
-            "(pytorch/pytorch#196708), and (5) a padded<->jagged "
-            "roundtrip that crashes backward (pytorch/pytorch#145837). "
+            "(pytorch/pytorch#196708), (5) a padded<->jagged "
+            "roundtrip that crashes backward (pytorch/pytorch#145837), "
+            "and (6) torch.func.jacfwd chained three deep silently "
+            "zeroes the 2nd/3rd derivative through a custom "
+            "torch.autograd.Function with a jvp staticmethod "
+            "(pytorch/pytorch#197867). "
             "Verifies that the safe_* guard functions produce the "
             "mathematically correct result instead. Never trusts a "
             "cached or previously-reported result, always re-runs the "
@@ -92,8 +96,13 @@ def main(argv=None) -> int:
     else:
         print(status_headline(style, "info", "padded<->jagged roundtrip bug did not reproduce on this host's installed torch build"))
 
+    if report["autograd_function_higher_order_bug_reproduced"]:
+        print(status_headline(style, "warn", "jacfwd chained 3-deep through custom autograd.Function silently zeroes 2nd/3rd derivative (#197867)"))
+    else:
+        print(status_headline(style, "info", "jacfwd-chain-through-custom-Function bug did not reproduce on this host's installed torch build"))
+
     if report["guards_fully_correct"]:
-        print(status_headline(style, "ok", "safe_nested_slogdet_second_order_jvp(), safe_nested_householder_product_second_order_jvp(), safe_layer_norm_second_order_jvp(), safe_jagged_narrow_unbind(), and safe_jagged_padded_transform() all match the mathematically correct value"))
+        print(status_headline(style, "ok", "safe_nested_slogdet_second_order_jvp(), safe_nested_householder_product_second_order_jvp(), safe_layer_norm_second_order_jvp(), safe_jagged_narrow_unbind(), safe_jagged_padded_transform(), and safe_autograd_function_higher_order_derivative() all match the mathematically correct value"))
     else:
         print(status_headline(style, "fail", "at least one guard did NOT match the expected value"))
 
@@ -144,6 +153,16 @@ def main(argv=None) -> int:
             ("buggy path raised RuntimeError on backward", f"{c['backward_raised_on_buggy_path']!s}"),
             ("guard backward succeeded", f"{c['guard_backward_succeeded']!s}"),
             ("guard forward matches reference", f"{c['guard_forward_matches_reference']!s}"),
+        ]
+    )
+
+    section("custom autograd.Function 3rd-order jacfwd chain (x=3.0, #197867)")
+    c = report["autograd_function_higher_order_case"]
+    print_fields(
+        [
+            ("expected [d1, d2, d3]", f"{c['expected_derivatives']!s}"),
+            ("buggy jacfwd chain (custom Function)", f"{c['custom_function_jacfwd_chain']!s}"),
+            ("guard (reverse-mode chain)", f"{c['guard_reverse_mode_chain']!s}"),
         ]
     )
 

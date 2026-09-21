@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torch-nested-ad-narrow-guard"
-version = "0.4.0"
-description = "Guards five real torch correctness bugs: nested (second-order) forward-mode AD silently returning the wrong value for slogdet, householder_product, and layer_norm, torch.nested.narrow(..., layout=torch.jagged) + unbind silently including an unselected element, and a padded<->jagged nested-tensor roundtrip that crashes the backward pass"
+version = "0.5.0"
+description = "Guards six real torch correctness bugs: nested (second-order) forward-mode AD silently returning the wrong value for slogdet, householder_product, and layer_norm, torch.func.jacfwd chained three deep silently zeroing higher-order derivatives through a custom autograd.Function, torch.nested.narrow(..., layout=torch.jagged) + unbind silently including an unselected element, and a padded<->jagged nested-tensor roundtrip that crashes the backward pass"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
