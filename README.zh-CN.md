@@ -1,193 +1,25 @@
 # torch-nested-ad-narrow-guard
 
-诊断并规避 PyTorch 中五个真实存在、已在本机独立复现的正确性缺陷
-（本机验证环境：torch 2.14.0，macOS arm64 CPU）：
+本仓库已合并到 [`torch-correctness-guards`](https://github.com/zhuhroscar-tech/torch-correctness-guards)。
 
-## 缺陷一 —— 嵌套前向模式自动微分静默将 slogdet 二阶导数归零
-
-**上游 issue：** [pytorch/pytorch#196697](https://github.com/pytorch/pytorch/issues/196697)（open）
-
-在 `torch.func.jvp` 内部再嵌套调用一次 `torch.func.jvp`（即"前向套前向"
-的二阶微分）时，`torch.linalg.slogdet` 的二阶导数会被静默地计算为
-`0.0`，而不是数学上正确的非零值。危险之处在于它**不会**报错、不会
-产生 NaN、也不会有任何警告。
-
-按 issue 原文精确复现（已在本机验证）：期望值
-`-0.17853600476096013`，实际返回 `0.0`。
-
-开发过程中额外验证："前向套反向"（`torch.func.grad` 作用于
-`torch.func.jvp`）**同样**是静默错误的（也返回 `0.0`）。只有"反向
-优先"的微分顺序才正确：反向套反向（两次
-`torch.autograd.grad(create_graph=True)`）和反向套前向
-（`torch.func.jvp` 作用于 `torch.func.grad`）均与解析值精确匹配。
-
-`safe_nested_slogdet_second_order_jvp(f, t)` 使用反向套反向的微分
-方式，已验证与解析值的误差小于 `1e-9`。
-
-## 缺陷二 —— jagged 嵌套张量的 narrow+unbind 会混入未选中的元素
-
-**上游 issue：** [pytorch/pytorch#196708](https://github.com/pytorch/pytorch/issues/196708)（open）
-
-`torch.nested.narrow(x, dim, starts, lengths, layout=torch.jagged)`
-之后再调用 `.unbind()`，至少有一行会静默地包含请求范围
-`[start, start+length)` 之外的元素。
-
-按 issue 原文精确复现（已在本机验证）：期望和为 `4.8999999999999995`
-(=7*t)，实际返回 `6.999999999999999` (=10*t，混入了未选中的 3*t)。
-
-`safe_jagged_narrow_unbind(dense_x, dim, starts, lengths)` 完全不调用
-有缺陷的 `torch.nested.narrow`，而是直接用普通张量索引构造正确的
-按行切片结果，已验证与期望选取结果完全一致。
-
-## 缺陷三 —— padded↔jagged 嵌套张量往返转换会导致反向传播崩溃
-
-**上游 issue：** [pytorch/pytorch#145837](https://github.com/pytorch/pytorch/issues/145837)（open）
-
-一个常见的 NestedTensor 使用模式——将 jagged 嵌套张量转换为 padded
-稠密形式（`torch.nested.to_padded_tensor`），执行某个 jagged 布局
-不直接支持的操作（例如加位置编码），再用
-`torch.nested.narrow(..., layout=torch.jagged)` 转换回 jagged——会在
-`.backward()` 时报错：
-
-```
-RuntimeError: Function CloneBackward0 returned an invalid gradient at
-index 0 - got [4, j21, 64] but expected shape compatible with [4, j20, 64]
-```
-
-已在本机用 3 条变长序列（长度 3/2/4，维度 8）独立复现：前向传播
-每次都能成功，只有 `.backward()` 会报错。这是一个训练流程的阻断性
-缺陷（不像缺陷一、二那样是静默错误的数值），会中断一个正常、常见
-的工作流程（给变长序列批次加位置信息）。
-
-`safe_jagged_padded_transform(nested_x, transform_fn)` 完全不调用
-`torch.nested.narrow`：先转为 padded 形式，应用 `transform_fn`，再
-用普通张量索引把每一行按原始长度切回并用 `torch.cat` 拼接——已验证
-`.backward()` 能顺利完成且不报错，前向结果也与独立计算的无梯度参考
-值完全一致。
-
-## 缺陷四 —— 嵌套前向模式自动微分对 householder_product 二阶导数同样静默出错
-
-**上游 issue：** [pytorch/pytorch#196698](https://github.com/pytorch/pytorch/issues/196698)（open）
-
-与缺陷一相同的故障类型，但作用于另一个不同的 `torch.linalg` 算子。
-这个缺陷是在扫描 PyTorch 的 `module: correctness (silent)` 标签时
-独立发现的，而非来自缺陷一的 issue 线索。`torch.func.jvp` 内部再
-嵌套调用一次 `torch.func.jvp` 时，`torch.linalg.householder_product`
-的二阶导数会被静默计算为错误值。
-
-按 issue 原文精确复现（已在本机验证）：期望值 `1.556251320682393`，
-实际返回 `-0.7533368863909331`。另外用闭式表达式
-`f(t) = 1 - 2*(1+t)/(1+t**2)` 的中心差分独立核验，得到
-`1.5562484634301652`，与解析值误差约 `1e-5`，确认了期望值本身的
-正确性（不仅仅是错误路径）。
-
-与缺陷一不同的是："反向套前向"（`torch.func.jvp` 作用于
-`torch.func.grad`）在这个算子上直接抛出 `RuntimeError`，而不是
-静默返回错误值；只有"反向套反向"（两次
-`torch.autograd.grad(create_graph=True)`）经验证是正确的。
-
-`safe_nested_householder_product_second_order_jvp(f, t)` 复用与
-缺陷一相同的反向套反向微分方式，已验证与中心差分核验值的误差小于
-`1e-9`。
-
-## 缺陷五 —— 嵌套前向模式自动微分对 layer_norm 二阶导数同样静默出错（符号错误）
-
-**上游 issue：** [pytorch/pytorch#196700](https://github.com/pytorch/pytorch/issues/196700)（open）
-
-与缺陷一、缺陷四相同的故障类型，作用于第三个不同的算子
-（`torch.nn.functional.layer_norm`），同样是在扫描 PyTorch 的
-`module: correctness (silent)` 标签时独立发现的。与缺陷一、四不同的
-是：这里不只是数值大小错误——嵌套 JVP 结果的**符号是反的**。
-
-按 issue 原文精确复现（已在本机验证）：期望值 `0.7749142079590942`，
-实际返回 `-0.38487405661968344`（符号相反且数值也不同）。
-
-另外用闭式表达式 `f(t) = -t / sqrt(1 + t**2)` 的中心差分独立核验
-（纯 Python 浮点数计算，不涉及任何自动微分），得到
-`0.774914199475063`，与解析值误差约 `1e-7`，确认了期望值本身的
-正确性。
-
-| 方法 | 本机结果 |
-|---|---|
-| 前向套前向（`jvp` 套 `jvp`）—— **有缺陷** | `-0.38487405661968344` |
-| 前向套反向（`grad` 套 `jvp`）—— **同样有缺陷** | `-0.3848740566196835` |
-| 反向套前向（`jvp` 套 `grad`）| 抛出 `RuntimeError`（functorch 变换限制，与缺陷四相同）|
-| 反向套反向（两次 `torch.autograd.grad(create_graph=True)`）| `0.7749142079590943` ✅ |
-| 中心差分（独立参考值）| `0.774914199475063` ✅（误差约 `1e-7`）|
-
-`safe_layer_norm_second_order_jvp(f, t)` 复用与缺陷一、四相同的
-反向套反向微分方式，已验证与中心差分核验值的误差小于 `1e-9`。
-
-## 缺陷六 —— jacfwd 三层链式调用经过自定义 autograd.Function 时静默将高阶导数归零
-
-**上游 issue：** [pytorch/pytorch#197867](https://github.com/pytorch/pytorch/issues/197867)（open）
-
-与缺陷一、四、五不同的触发方式（那三个都需要 `torch.func.jvp`
-直接嵌套在另一个 `jvp` 内部）。这个缺陷需要将 `torch.func.jacfwd`
-链式调用三层，对一个经过自定义 `torch.autograd.Function`（定义了
-`jvp` 静态方法——这是官方文档推荐的让自定义 Function 兼容前向模式
-自动微分的方式）的函数求导。
-
-按 issue 原文精确复现（已在本机验证）：对于
-`custom(x) = Square.apply(Square.apply(x))`（数学上等价于
-`x**4`，`Square` 是一个 `jvp` 实现正确的最小自定义 Function），
-纯张量运算给出导数序列 `[108.0, 108.0, 72.0]`（x=3 处）；自定义
-Function 版本给出 `[108.0, 0.0, 0.0]`——一阶导数正确，二阶、三阶
-静默归零。
-
-| 方法 | x=3.0 处结果 |
-|---|---|
-| 纯张量运算 `((x*x)*(x*x)).sum()`，jacfwd 链式 | `[108.0, 108.0, 72.0]` ✅ |
-| 自定义 Function（`jvp` 解析正确），jacfwd 链式 —— **有缺陷** | `[108.0, 0.0, 0.0]` |
-| 自定义 Function，反向模式链式（重复调用 `autograd.grad(create_graph=True)`） | `[108.0, 108.0, 72.0]` ✅ |
-
-`safe_autograd_function_higher_order_derivative(f, x, order)`
-完全避开前向模式自动微分：通过 `order` 次链式调用
-`torch.autograd.grad(create_graph=True)`（纯反向模式）计算所需阶数
-的导数，已在本机验证：对纯张量运算函数和自定义 Function 版本都能
-正确复现 `[108.0, 108.0, 72.0]` 序列——证明该缺陷是自定义 Function
-的 `jvp` 路径下前向模式自动微分特有的问题，而非计算该函数三阶导数
-本身存在根本限制。
-
-**本规避方案未独立核验**：`jacrev`-of-`jacfwd`（反向套前向）在二、
-三阶下的表现，以及去掉 `generate_vmap_rule = True` 后缺陷是否依然
-存在。本次验证范围仅限于证明反向模式链式方案本身是正确的，并未
-穷尽所有会触发上游缺陷的求导阶数/组合。
-
-## 安装
+请改用总包：
 
 ```bash
-pip install "torch-nested-ad-narrow-guard[torch]"
+python -m pip install git+https://github.com/zhuhroscar-tech/torch-correctness-guards.git
+
+torch-guard run nested-ad-narrow
 ```
 
-## 使用
+对应的 Python API 已由 `torch_correctness_guards` 导出：
 
-```bash
-torch-nested-ad-narrow-guard          # 人类可读报告
-torch-nested-ad-narrow-guard --json   # 机器可读 JSON
-torch-nested-ad-narrow-guard --no-color
+```python
+from torch_correctness_guards import diagnose_nested_ad_narrow
+from torch_correctness_guards import safe_nested_slogdet_second_order_jvp
+from torch_correctness_guards import safe_nested_householder_product_second_order_jvp
+from torch_correctness_guards import safe_layer_norm_second_order_jvp
+from torch_correctness_guards import safe_jagged_narrow_unbind
+from torch_correctness_guards import safe_jagged_padded_transform
+from torch_correctness_guards import safe_autograd_function_higher_order_derivative
 ```
 
-## 真实局限性
-
-- `safe_jagged_narrow_unbind` 目前仅支持 `dim=1`（与上游复现代码一致）
-  及稠密二维输入，未覆盖所有 jagged-narrow 调用形态。
-- `safe_nested_slogdet_second_order_jvp` 要求 `f` 可被
-  `torch.autograd` 直接微分（内部不能再使用 `torch.func` 变换）。
-- `safe_jagged_padded_transform` 要求 `transform_fn` 保持 padded
-  张量的形状不变（`[batch, max_len, ...]` 进，同形状出），且仅支持
-  沿序列长度维度（dim=1）重建，不支持改变批次大小或序列长度的变换。
-- `safe_autograd_function_higher_order_derivative` 要求 `f` 可被
-  `torch.autograd` 直接微分且返回标量，不支持仅兼容前向模式自动
-  微分的函数，也未穷尽所有会触发上游 #197867 的 jacfwd 链式深度/
-  vmap 规则组合，仅验证了 issue 原文的复现形态。
-- 这些是**规避方案**，不是上游修复。如果 PyTorch 未来修复了这些
-  issue，本包自身的回归测试会失败——这是需要重新核实并更新本
-  README 的信号，而非本包出现了退化。
-- 仅在 torch 2.14.0（macOS arm64 CPU 本机测试 + ubuntu-latest /
-  macos-latest CI，均为纯 CPU）上验证过，未在 CUDA/ROCm/MPS 加速
-  路径上独立验证。
-
-## 许可证
-
-MIT
+本源仓库已归档，以便 GitHub 账号聚焦于更少、更完整的软件包。原功能已作为 `nested-ad-narrow` guard 保留在总包中。

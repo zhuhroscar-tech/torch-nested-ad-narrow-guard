@@ -1,5 +1,5 @@
 """torch-nested-ad-narrow-guard: version and package marker."""
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 from .core import (
     safe_nested_slogdet_second_order_jvp,
